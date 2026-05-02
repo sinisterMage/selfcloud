@@ -80,20 +80,18 @@ type UnitParams struct {
 
 const systemdTemplate = `[Unit]
 Description=selfCloud node
-After=network-online.target
+After=network-online.target containerd.service
 Wants=network-online.target
+Requires=containerd.service
 
 [Service]
-Type=notify
+Type=simple
 ExecStart={{.BinaryPath}} server --data-dir {{.DataDir}} --api-addr {{.APIAddr}}
 Restart=on-failure
 RestartSec=2s
 User={{.User}}
 Group={{.Group}}
 LimitNOFILE=65536
-NoNewPrivileges=yes
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target

@@ -1,10 +1,25 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, Upload, Zap } from "lucide-react";
-import { api } from "../lib/api";
+import { Plus, Trash2, Upload, UploadCloud, Zap } from "lucide-react";
+import { api, getToken } from "../lib/api";
 import type { FunctionRecord } from "../lib/types";
 
 const project = "default";
+
+async function uploadCode(name: string, file: File) {
+  const buf = await file.arrayBuffer();
+  const res = await fetch(`/api/v1/projects/${project}/functions/${name}/code`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/octet-stream",
+      ...(getToken() ? { authorization: `Bearer ${getToken()}` } : {}),
+    },
+    body: buf,
+  });
+  if (!res.ok) {
+    throw new Error(`upload failed: ${res.status} ${res.statusText}`);
+  }
+}
 
 export default function FunctionsPage() {
   const qc = useQueryClient();
@@ -55,12 +70,21 @@ export default function FunctionsPage() {
                   ))}
                 </td>
                 <td className="px-4 py-2">
-                  <span className={f.status?.phase === "Running" ? "badge-success" : "badge"}>
-                    {f.status?.phase || "—"}
-                  </span>
+                  {!f.sourceRef ? (
+                    <span className="badge-warn">no code</span>
+                  ) : (
+                    <span className={f.status?.phase === "Running" ? "badge-success" : "badge"}>
+                      {f.status?.phase || "Ready"}
+                    </span>
+                  )}
                 </td>
                 <td className="px-4 py-2 text-right">
-                  <button className="btn" onClick={() => fetch(`/fn/${project}/${f.meta.name}`).catch(() => {})}>
+                  <UploadCodeButton fn={f} />
+                  <button
+                    className="btn ml-2"
+                    title="Invoke (opens in new tab)"
+                    onClick={() => window.open(`/fn/${project}/${f.meta.name}`, "_blank")}
+                  >
                     <Zap size={14} />
                   </button>
                   <button className="btn-danger ml-2" onClick={() => remove.mutate(f.meta.name)}>
@@ -78,6 +102,43 @@ export default function FunctionsPage() {
 
       {open && <NewFunctionDialog onClose={() => setOpen(false)} />}
     </div>
+  );
+}
+
+function UploadCodeButton({ fn }: { fn: FunctionRecord }) {
+  const qc = useQueryClient();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  return (
+    <>
+      <input
+        ref={inputRef}
+        type="file"
+        className="hidden"
+        onChange={async (e) => {
+          const f = e.target.files?.[0];
+          if (!f) return;
+          setBusy(true);
+          try {
+            await uploadCode(fn.meta.name, f);
+            qc.invalidateQueries({ queryKey: ["functions"] });
+          } catch (err) {
+            alert(err instanceof Error ? err.message : "upload failed");
+          } finally {
+            setBusy(false);
+            if (inputRef.current) inputRef.current.value = "";
+          }
+        }}
+      />
+      <button
+        className="btn"
+        title={fn.sourceRef ? "Replace code" : "Upload code"}
+        onClick={() => inputRef.current?.click()}
+        disabled={busy}
+      >
+        <UploadCloud size={14} />
+      </button>
+    </>
   );
 }
 

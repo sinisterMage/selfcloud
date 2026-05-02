@@ -54,9 +54,30 @@ func (r *CtrRuntime) run(ctx context.Context, args ...string) ([]byte, []byte, e
 }
 
 // Start pulls the image (best effort) and runs the container detached.
+// Idempotent: if a container with the same id already exists in containerd
+// we return its status instead of erroring.
 func (r *CtrRuntime) Start(ctx context.Context, c *store.Container) (*store.ContainerStatus, error) {
-	if _, _, err := r.run(ctx, "images", "pull", c.Image); err != nil {
-		return nil, fmt.Errorf("pull %s: %w", c.Image, err)
+	id := ctrTaskID(c)
+
+	// If the container already exists, treat as a no-op success.
+	if existing, _, err := r.run(ctx, "containers", "list", "-q"); err == nil {
+		for _, line := range strings.Split(strings.TrimSpace(string(existing)), "\n") {
+			if strings.TrimSpace(line) == id {
+				return &store.ContainerStatus{
+					Status: store.Status{
+						Phase:     store.PhaseRunning,
+						Message:   "already running",
+						UpdatedAt: time.Now().UTC(),
+					},
+					ContainerdID: id,
+					Image:        c.Image,
+				}, nil
+			}
+		}
+	}
+
+	if _, stderr, err := r.run(ctx, "images", "pull", c.Image); err != nil {
+		return nil, fmt.Errorf("pull %s: %w (%s)", c.Image, err, strings.TrimSpace(string(stderr)))
 	}
 	args := []string{"run", "-d"}
 	for k, v := range c.Env {
@@ -65,7 +86,7 @@ func (r *CtrRuntime) Start(ctx context.Context, c *store.Container) (*store.Cont
 	for _, p := range c.Ports {
 		args = append(args, "--label", fmt.Sprintf("selfcloud.port.%d=%d/%s", p.Container, p.Host, p.Protocol))
 	}
-	args = append(args, c.Image, ctrTaskID(c))
+	args = append(args, c.Image, id)
 	args = append(args, c.Command...)
 	args = append(args, c.Args...)
 	if _, stderr, err := r.run(ctx, args...); err != nil {
@@ -77,7 +98,7 @@ func (r *CtrRuntime) Start(ctx context.Context, c *store.Container) (*store.Cont
 			Message:   "started",
 			UpdatedAt: time.Now().UTC(),
 		},
-		ContainerdID: ctrTaskID(c),
+		ContainerdID: id,
 		StartedAt:    time.Now().UTC(),
 		Image:        c.Image,
 	}, nil

@@ -26,6 +26,10 @@ func (s *Server) handleFunctionInvoke(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 404, "function not found")
 		return
 	}
+	if f.SourceRef == "" {
+		httpError(w, 503, "function has no code deployed; upload a .wasm via POST /api/v1/projects/"+project+"/functions/"+name+"/code")
+		return
+	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	subPath := "/"
 	if len(parts) > 2 {
@@ -40,6 +44,10 @@ func (s *Server) handleFunctionInvoke(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := s.invoke(r.Context(), f, req)
 	if err != nil {
+		if errors.Is(err, wasm.ErrFunctionNotReady) {
+			httpError(w, 503, "function is deploying; try again in a moment")
+			return
+		}
 		httpError(w, 500, err.Error())
 		return
 	}

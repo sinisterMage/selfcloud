@@ -69,7 +69,7 @@ export interface FunctionRecord {
   meta: Meta;
   runtime: "wasm" | "firecracker";
   handler?: string;
-  sourceRef: string;
+  sourceRef?: string;
   triggers: FunctionTrigger[];
   env?: Record<string, string>;
   memoryMB?: number;
