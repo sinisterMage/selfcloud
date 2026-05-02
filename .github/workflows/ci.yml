@@ -1,0 +1,76 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Build dashboard
+        run: |
+          cd web
+          bun install --frozen-lockfile
+          bun run build
+          mkdir -p ../internal/api/web_dist
+          cp -r dist/* ../internal/api/web_dist/
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  build-matrix:
+    needs: lint-test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Build dashboard
+        run: |
+          cd web
+          bun install --frozen-lockfile
+          bun run build
+          mkdir -p ../internal/api/web_dist
+          cp -r dist/* ../internal/api/web_dist/
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p bin
+          go build -trimpath -ldflags '-s -w' \
+            -o bin/selfcloud-${{ matrix.goos }}-${{ matrix.goarch }} \
+            ./cmd/selfcloud
+      - uses: actions/upload-artifact@v4
+        with:
+          name: selfcloud-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/selfcloud-*

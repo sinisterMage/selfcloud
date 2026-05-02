@@ -1,0 +1,40 @@
+# Binaries
+/bin/
+/dist/
+selfcloud
+terraform-provider-selfcloud
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Local data
+/var/
+*.db
+*.boltdb
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Env
+.env
+.env.local
+
+# Build artifacts
+*.tar.gz
+*.zip
+
+# Embedded UI staging
+internal/api/web_dist/
