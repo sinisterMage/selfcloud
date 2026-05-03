@@ -250,6 +250,29 @@ func (e *EventRule) getMeta() *Meta        { return &e.Meta }
 func (b *Build) getMeta() *Meta            { return &b.Meta }
 func (d *WebhookDelivery) getMeta() *Meta  { return &d.Meta }
 
+// localDelete is the generic delete used by ReplicatedStore on the
+// single-node fast path. It mirrors what each typed Delete* does
+// (s.del + s.emit) so the wrapper doesn't need to enumerate every type.
+// Multi-node deletes go through Raft and apply via FSM.Apply, which
+// emits independently.
+func (s *Store) localDelete(bucket string, kind Kind, project, name string) error {
+	var key []byte
+	if project == "" {
+		key = []byte(name)
+		// Cluster-scoped types stored under "system/<name>".
+		if kind == KindNode || kind == KindUser || kind == KindToken {
+			key = []byte("system/" + name)
+		}
+	} else {
+		key = keyFor(project, name)
+	}
+	if err := s.del(bucket, key); err != nil {
+		return err
+	}
+	s.emit(Event{Kind: kind, Op: "delete", Project: project, Name: name})
+	return nil
+}
+
 func (s *Store) putScoped(bucket string, kind Kind, v projectScoped) error {
 	m := v.getMeta()
 	if m.Project == "" {

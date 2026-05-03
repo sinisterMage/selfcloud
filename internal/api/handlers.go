@@ -70,7 +70,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReady(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, map[string]any{"ready": true})
+	if s.ready == nil {
+		writeJSON(w, 200, map[string]any{"ready": true})
+		return
+	}
+	overall, parts := s.ready.Snapshot()
+	status := http.StatusOK
+	if !overall {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, map[string]any{
+		"ready":      overall,
+		"components": parts,
+	})
 }
 
 func (s *Server) handleMeta(w http.ResponseWriter, _ *http.Request) {
@@ -112,7 +124,14 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 400, err.Error())
 		return
 	}
-	if err := s.auth.ConsumeBootstrapToken(r.Context(), body.BootstrapToken); err != nil {
+	if body.AdminEmail == "" || body.AdminPassword == "" || body.AdminName == "" {
+		httpError(w, 400, "adminName, adminEmail and adminPassword are required")
+		return
+	}
+	// Verify (but don't yet consume) the bootstrap token. We only consume
+	// it at the very end so a failed wizard run can be retried with the
+	// same token.
+	if err := s.auth.VerifyBootstrapToken(r.Context(), body.BootstrapToken); err != nil {
 		httpError(w, 401, "invalid bootstrap token")
 		return
 	}
@@ -121,30 +140,35 @@ func (s *Server) handleInitialize(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, err.Error())
 		return
 	}
-	cfg, err := s.store.GetCluster(r.Context())
-	if err != nil {
-		httpError(w, 500, err.Error())
-		return
-	}
-	cfg.Initialized = true
-	cfg.MultiNode = body.MultiNode
-	if cfg.ReplicationFactor == 0 {
-		if body.MultiNode {
-			cfg.ReplicationFactor = 1 // bumps to 3 once 3 storage nodes present
-		} else {
-			cfg.ReplicationFactor = 1
-		}
-	}
-	if err := s.store.PutCluster(r.Context(), cfg); err != nil {
-		httpError(w, 500, err.Error())
-		return
-	}
 	tok, err := s.auth.CreateToken(r.Context(), "admin-initial", u.Meta.Name, 0, true)
 	if err != nil {
 		httpError(w, 500, err.Error())
 		return
 	}
-	_ = s.ensureDefaultProject(r.Context())
+	if err := s.ensureDefaultProject(r.Context()); err != nil {
+		httpError(w, 500, err.Error())
+		return
+	}
+	cfg, err := s.store.GetCluster(r.Context())
+	if err != nil {
+		httpError(w, 500, err.Error())
+		return
+	}
+	cfg.MultiNode = body.MultiNode
+	if cfg.ReplicationFactor == 0 {
+		cfg.ReplicationFactor = 1 // bumps to 3 once 3 storage nodes present
+	}
+	if err := s.store.PutCluster(r.Context(), cfg); err != nil {
+		httpError(w, 500, err.Error())
+		return
+	}
+	// Final step: clear the bootstrap token + mark Initialized=true. Up
+	// to this point the wizard is idempotent: a failure leaves the token
+	// usable for a retry.
+	if err := s.auth.ConsumeBootstrapToken(r.Context(), body.BootstrapToken); err != nil {
+		httpError(w, 500, err.Error())
+		return
+	}
 	writeJSON(w, 201, map[string]any{
 		"user":  u,
 		"token": tok.Plaintext,
@@ -303,6 +327,14 @@ func (s *Server) handlePutContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.Meta.Project = r.PathValue("project")
+	// Assign a node when the caller didn't pin one. The scheduler picks
+	// the longest-idle compute node; on a single-node cluster this is
+	// always the local node.
+	if c.NodeID == "" && s.scheduler != nil {
+		if id, err := s.scheduler.Place(r.Context(), &c); err == nil {
+			c.NodeID = id
+		}
+	}
 	if err := s.store.PutContainer(r.Context(), &c); mapStoreErr(w, err) {
 		return
 	}
@@ -483,6 +515,17 @@ func (s *Server) handleCreateAccessKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, a)
 }
 
+func (s *Server) handleGetAccessKey(w http.ResponseWriter, r *http.Request) {
+	a, err := s.store.GetAccessKey(r.Context(), r.PathValue("project"), r.PathValue("name"))
+	if mapStoreErr(w, err) {
+		return
+	}
+	// Strip the secret on read; it's only ever returned to the API
+	// caller at create time.
+	a.SecretAccessKey = ""
+	writeJSON(w, 200, a)
+}
+
 func (s *Server) handleDeleteAccessKey(w http.ResponseWriter, r *http.Request) {
 	a, err := s.store.GetAccessKey(r.Context(), r.PathValue("project"), r.PathValue("name"))
 	if mapStoreErr(w, err) {
@@ -550,6 +593,16 @@ func (s *Server) handlePutFunction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.Source.Git.WebhookToken = t
+	}
+
+	// Assign a placement node so multi-node clusters spread function
+	// invocations rather than always running them on the API leader.
+	// Status.NodeID is the canonical "where this currently lives" pointer
+	// for functions (the spec doesn't carry a separate NodeID field).
+	if f.Status.NodeID == "" && s.scheduler != nil {
+		if id, err := s.scheduler.PlaceFunction(r.Context(), &f); err == nil {
+			f.Status.NodeID = id
+		}
 	}
 
 	if err := s.store.PutFunction(r.Context(), &f); mapStoreErr(w, err) {

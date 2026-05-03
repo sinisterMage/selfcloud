@@ -18,13 +18,20 @@ type joinReq struct {
 	CapacityGB    int64  `json:"capacityGB"`
 }
 
+// joinResp is the minimal view a joining node needs. We deliberately do
+// NOT return the full ClusterConfig here because it carries the bootstrap
+// token hash, S3 internal key, and other cluster-wide secrets unrelated
+// to bringing the new node online. Garage's RPC secret + admin token are
+// included only because the joining node's local Garage instance needs
+// them to peer with the cluster.
 type joinResp struct {
-	NodeID         string                `json:"nodeId"`
-	Cluster        *store.ClusterConfig  `json:"cluster"`
-	Peers          []store.Node          `json:"peers"`
-	GarageRPC      string                `json:"garageRpcSecret,omitempty"`
-	GarageAdmin    string                `json:"garageAdminToken,omitempty"`
-	Version        string                `json:"version"`
+	NodeID            string       `json:"nodeId"`
+	MultiNode         bool         `json:"multiNode"`
+	ReplicationFactor int          `json:"replicationFactor"`
+	Peers             []store.Node `json:"peers"`
+	GarageRPC         string       `json:"garageRpcSecret,omitempty"`
+	GarageAdmin       string       `json:"garageAdminToken,omitempty"`
+	Version           string       `json:"version"`
 }
 
 // handleClusterJoin is the unauthenticated endpoint that joining nodes hit.
@@ -73,7 +80,11 @@ func (s *Server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 		httpError(w, 500, err.Error())
 		return
 	}
-	cfg, _ := s.store.GetCluster(r.Context())
+	cfg, err := s.store.GetCluster(r.Context())
+	if err != nil {
+		httpError(w, 500, "load cluster: "+err.Error())
+		return
+	}
 	cfg.MultiNode = true
 	if err := s.store.PutCluster(r.Context(), cfg); err != nil {
 		httpError(w, 500, err.Error())
@@ -81,11 +92,12 @@ func (s *Server) handleClusterJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	peers, _ := s.store.ListNodes(r.Context())
 	writeJSON(w, 200, joinResp{
-		NodeID:      body.NodeID,
-		Cluster:     cfg,
-		Peers:       peers,
-		GarageRPC:   cfg.GarageRPCSecret,
-		GarageAdmin: cfg.GarageAdminToken,
-		Version:     version.String(),
+		NodeID:            body.NodeID,
+		MultiNode:         cfg.MultiNode,
+		ReplicationFactor: cfg.ReplicationFactor,
+		Peers:             peers,
+		GarageRPC:         cfg.GarageRPCSecret,
+		GarageAdmin:       cfg.GarageAdminToken,
+		Version:           version.String(),
 	})
 }

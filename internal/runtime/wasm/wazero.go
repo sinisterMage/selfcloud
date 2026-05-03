@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -160,6 +162,26 @@ func (w *Wazero) Invoke(ctx context.Context, fn *store.Function, req *InvokeRequ
 		WithEnv("SELFCLOUD_PROJECT", fn.Meta.Project).
 		WithEnv("SELFCLOUD_REQUEST_METHOD", req.Method).
 		WithEnv("SELFCLOUD_REQUEST_PATH", req.Path)
+
+	// File-mode secret mounts: stage the bytes into a per-invocation
+	// tempdir on the host and project it at /secrets inside the guest.
+	// Cleanup runs after the call returns.
+	if len(req.SecretFiles) > 0 {
+		tmp, err := os.MkdirTemp("", "selfcloud-fn-secrets-*")
+		if err == nil {
+			defer os.RemoveAll(tmp)
+			for guestPath, data := range req.SecretFiles {
+				name := filepath.Base(guestPath)
+				if name == "" || name == "." || name == "/" {
+					name = "secret"
+				}
+				_ = os.WriteFile(filepath.Join(tmp, name), data, 0o400)
+			}
+			cfg = cfg.WithFSConfig(wazero.NewFSConfig().WithDirMount(tmp, "/secrets"))
+		} else {
+			log.With("err", err).Warn("wasm: secret stage tmpdir failed")
+		}
+	}
 
 	start := time.Now()
 	mod, err := w.rt.InstantiateModule(cctx, c.mod, cfg)

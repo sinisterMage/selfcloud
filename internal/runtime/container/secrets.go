@@ -10,13 +10,9 @@ import (
 
 // writeSecretFile writes a resolved secret value to disk under
 // <dataDir>/secret-mounts/<container-uid>/<basename(mountPath)> with
-// 0600 permissions. The container runtime is expected to bind-mount
-// that directory into the container at the requested path.
-//
-// Today the containerd shim doesn't read these mounts (it shells out to
-// `ctr run` which doesn't expose volume flags); this hook still creates
-// the files so users can sanity-check their secret data and so a future
-// containerd Go-API integration can pick them up.
+// 0600 permissions. CtrRuntime bind-mounts that file into the container
+// at the requested MountPath at start time (see ctr.go), so the file is
+// the actual source of truth the workload reads.
 func writeSecretFile(dataDir string, c *store.Container, mountPath, plaintext string) error {
 	if dataDir == "" {
 		dataDir = "/var/lib/selfcloud"

@@ -44,11 +44,12 @@ type Reconciler struct {
 }
 
 type reconcileState struct {
-	lastAttempt time.Time
-	nextAttempt time.Time
-	attempts    int
-	lastGen     int64
-	startedOK   bool
+	lastAttempt    time.Time
+	nextAttempt    time.Time
+	lastAliveCheck time.Time
+	attempts       int
+	lastGen        int64
+	startedOK      bool
 }
 
 // NewReconciler wires the dependencies. Bus and secrets are optional
@@ -70,10 +71,15 @@ func (r *Reconciler) WithBus(b EventEmitter) *Reconciler {
 }
 
 // WithSecrets attaches a secret resolver so secret:// refs in env and
-// SecretMounts are resolved at start time.
+// SecretMounts are resolved at start time. dataDir is the host directory
+// under which the reconciler stages secret-mount files — it must match
+// the runtime's bind-source root (see CtrRuntime.SetDataDir).
 func (r *Reconciler) WithSecrets(s SecretResolver, dataDir string) *Reconciler {
 	r.secrets = s
 	r.dataDir = dataDir
+	if dd, ok := r.rt.(interface{ SetDataDir(string) }); ok {
+		dd.SetDataDir(dataDir)
+	}
 	return r
 }
 
@@ -163,11 +169,30 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *store.Container, nodeI
 
 	now := time.Now()
 
-	// If we already started this exact spec successfully, do nothing.
-	// Generation increments on every PutContainer so a real change
-	// (image, ports, env) will bump it and force a fresh start.
+	// If we already started this exact spec successfully, decide whether
+	// the runtime still has it alive. If not, RestartPolicy decides
+	// whether to bring it back.
 	if st.startedOK && st.lastGen == c.Meta.Generation && c.Status.Phase == store.PhaseRunning {
-		return
+		if !r.shouldVerifyAlive(c, st, now) {
+			return
+		}
+		alive := r.isRunning(ctx, c)
+		st.lastAliveCheck = now
+		if alive {
+			return
+		}
+		// The runtime no longer reports the task. Apply RestartPolicy.
+		if !shouldRestart(c.RestartPolicy) {
+			c.Status.Phase = store.PhaseStopped
+			c.Status.Message = "exited (restartPolicy=" + string(c.RestartPolicy) + ")"
+			c.Status.UpdatedAt = now.UTC()
+			_ = r.st.PutContainer(ctx, c)
+			st.startedOK = false
+			return
+		}
+		log.With("name", c.Meta.Name).Info("reconcile: container exited, restarting per policy")
+		st.startedOK = false
+		// fall through into the start path below
 	}
 
 	// Backoff: if we attempted recently and failed, wait until nextAttempt.
@@ -299,4 +324,42 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *store.Container, nodeI
 
 func fmtInt(i int) string {
 	return strconv.Itoa(i)
+}
+
+// shouldVerifyAlive returns true when the reconciler has gone long enough
+// without checking the runtime to be worth a probe. We don't probe on
+// every event so the hot reconcile loop stays cheap.
+func (r *Reconciler) shouldVerifyAlive(_ *store.Container, st *reconcileState, now time.Time) bool {
+	return now.Sub(st.lastAliveCheck) > 8*time.Second
+}
+
+// isRunning queries the runtime via the optional liveness hook. If the
+// runtime doesn't expose one (e.g. the in-memory stub) we conservatively
+// answer "yes" so we don't stop-and-restart healthy containers.
+func (r *Reconciler) isRunning(ctx context.Context, c *store.Container) bool {
+	type alive interface {
+		IsRunning(ctx context.Context, c *store.Container) (bool, error)
+	}
+	if a, ok := r.rt.(alive); ok {
+		ok, err := a.IsRunning(ctx, c)
+		if err != nil {
+			log.With("err", err, "name", c.Meta.Name).Debug("reconcile: liveness check failed")
+			return true
+		}
+		return ok
+	}
+	return true
+}
+
+// shouldRestart maps a RestartPolicy onto a "restart-on-exit" decision.
+// We don't distinguish exit codes today; OnFailure currently behaves the
+// same as Always. That can be tightened once the runtime exposes the
+// exit code.
+func shouldRestart(p store.RestartPolicy) bool {
+	switch p {
+	case store.RestartAlways, store.RestartOnFailure:
+		return true
+	default:
+		return false
+	}
 }

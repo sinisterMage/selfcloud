@@ -22,6 +22,7 @@ import (
 	"github.com/selfcloud/selfcloud/internal/runtime/container"
 	"github.com/selfcloud/selfcloud/internal/runtime/firecracker"
 	"github.com/selfcloud/selfcloud/internal/runtime/wasm"
+	"github.com/selfcloud/selfcloud/internal/scheduler"
 	"github.com/selfcloud/selfcloud/internal/secrets"
 	"github.com/selfcloud/selfcloud/internal/storage/garage"
 	"github.com/selfcloud/selfcloud/internal/store"
@@ -30,7 +31,7 @@ import (
 // Server bundles the HTTP server with all its dependencies. One per node.
 type Server struct {
 	cfg         *config.Config
-	store       *store.Store
+	store       *store.ReplicatedStore
 	auth        *auth.Manager
 	cluster     *cluster.Manager
 	containers  container.Runtime
@@ -43,6 +44,8 @@ type Server struct {
 	bus         *events.Bus
 	secrets     *secrets.Manager
 	builder     BuilderHook
+	scheduler   *scheduler.Scheduler
+	ready       *readiness
 	httpSrv     *http.Server
 	startedAt   time.Time
 	invocations *invocationRing
@@ -63,7 +66,7 @@ type BuilderHook interface {
 // everything from one place.
 type Options struct {
 	Config      *config.Config
-	Store       *store.Store
+	Store       *store.ReplicatedStore
 	Auth        *auth.Manager
 	Cluster     *cluster.Manager
 	Containers  container.Runtime
@@ -76,16 +79,19 @@ type Options struct {
 	Bus         *events.Bus
 	Secrets     *secrets.Manager
 	Builder     BuilderHook
+	Scheduler   *scheduler.Scheduler
 }
 
 // AttachRuleDispatcher registers a *events.RuleDispatcher onto the bus
 // using adapters that bridge to this server's runtime façades. Called
-// from cmd/selfcloud/server.go once the Server is built.
+// from cmd/selfcloud/server.go once the Server is built. The dispatcher
+// only reads the store (rule lookup), so we hand it the bare *Store via
+// the embedded pointer.
 func (s *Server) AttachRuleDispatcher() {
 	if s.bus == nil || s.store == nil {
 		return
 	}
-	disp := events.NewRuleDispatcher(s.store,
+	disp := events.NewRuleDispatcher(s.store.Store,
 		functionInvokerAdapter{s: s},
 		containerControlAdapter{s: s},
 	)
@@ -109,10 +115,17 @@ func New(opt Options) *Server {
 		bus:         opt.Bus,
 		secrets:     opt.Secrets,
 		builder:     opt.Builder,
+		scheduler:   opt.Scheduler,
+		ready:       newReadiness(),
 		startedAt:   time.Now().UTC(),
 		invocations: newInvocationRing(100),
 	}
 }
+
+// Ready returns the readiness tracker used by /readyz so external code
+// (cmd/selfcloud/server.go) can declare individual subsystems healthy
+// as their async startup completes.
+func (s *Server) Ready() *readiness { return s.ready }
 
 // s3Client returns a memoised minio client signed with the cluster-level
 // internal admin key. It returns an error if the key isn't provisioned yet
@@ -160,7 +173,7 @@ func (s *Server) s3Client(ctx context.Context) (*minio.Client, error) {
 // Run starts listening. Blocks until ctx is cancelled or the server errors.
 func (s *Server) Run(ctx context.Context) error {
 	mux := s.routes()
-	handler := s.recoverer(s.requestLogger(s.cors(mux)))
+	handler := s.recoverer(s.requestLogger(s.cors(s.leaderRedirect(mux))))
 	srv := &http.Server{
 		Addr:              s.cfg.APIAddr,
 		Handler:           handler,
@@ -177,6 +190,14 @@ func (s *Server) Run(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.With("addr", s.cfg.APIAddr, "tls", !s.cfg.DisableTLS).Info("api: listening")
+		// Mark the API ready as soon as the listener is bound. We do
+		// this just before ListenAndServe blocks; the goroutine
+		// scheduling means there's a tiny window where the socket
+		// isn't yet accepting, but in practice the dashboard's poll
+		// interval (500ms) absorbs it.
+		if s.ready != nil {
+			s.ready.Mark("api", true, "listening on "+s.cfg.APIAddr)
+		}
 		var err error
 		if s.cfg.DisableTLS {
 			err = srv.ListenAndServe()
@@ -228,6 +249,79 @@ func (s *Server) requireAuth(next http.Handler, adminOnly bool) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), id)))
 	})
+}
+
+// leaderRedirect 307-redirects non-GET requests to the current Raft
+// leader's API address when this node is a follower. Read-only requests
+// stay local — followers serve them from their own BoltDB. Endpoints
+// that don't write through the API store layer (S3 proxy, function
+// invocation, dashboard assets, healthz/readyz) are exempted by path
+// so latency-sensitive traffic doesn't bounce through the leader.
+func (s *Server) leaderRedirect(next http.Handler) http.Handler {
+	exempt := func(path string) bool {
+		switch {
+		case strings.HasPrefix(path, "/healthz"),
+			strings.HasPrefix(path, "/readyz"),
+			strings.HasPrefix(path, "/api/v1/meta"),
+			strings.HasPrefix(path, "/api/v1/setup/"),
+			strings.HasPrefix(path, "/api/v1/auth/login"),
+			strings.HasPrefix(path, "/api/v1/cluster/join"),
+			strings.HasPrefix(path, "/fn/"),
+			strings.HasPrefix(path, "/webhooks/"),
+			strings.HasPrefix(path, "/s3/"),
+			strings.HasPrefix(path, "/assets"):
+			return true
+		}
+		return path == "/" || !strings.HasPrefix(path, "/api/")
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only consider redirect when raft has been wired AND this is
+		// a write. GETs always go local.
+		if s.raft == nil || r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if exempt(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if s.raft.IsLeader() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Try to find the leader's API address. The Raft transport
+		// address is host:raftPort; we want host:apiPort. We look up
+		// the matching node in the store, fall back to a 503 if we
+		// can't resolve it.
+		raftAddr := s.raft.LeaderAddr()
+		if raftAddr == "" {
+			httpError(w, http.StatusServiceUnavailable, "no raft leader yet")
+			return
+		}
+		apiAddr := s.leaderAPIAddr(r.Context(), raftAddr)
+		if apiAddr == "" {
+			httpError(w, http.StatusServiceUnavailable, "leader api address unknown")
+			return
+		}
+		// Strip the scheme; we always use https.
+		target := "https://" + apiAddr + r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	})
+}
+
+// leaderAPIAddr resolves a raft transport address to the matching node's
+// public API address, looked up in the nodes table.
+func (s *Server) leaderAPIAddr(ctx context.Context, raftAddr string) string {
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, n := range nodes {
+		if n.RaftAddress == raftAddr && n.APIAddress != "" {
+			return n.APIAddress
+		}
+	}
+	return ""
 }
 
 func (s *Server) cors(next http.Handler) http.Handler {

@@ -3,6 +3,7 @@
 package firecracker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -24,9 +25,13 @@ import (
 	"github.com/selfcloud/selfcloud/internal/store"
 )
 
-// Jailer drives Firecracker via the firecracker binary on the host. Each
-// invocation spawns its own VM; per-function snapshots can be layered on
-// later via (j *Jailer).snapshot/restore.
+// Jailer drives Firecracker via the firecracker binary on the host.
+//
+// First invocation of a function runs cold (kernel + rootfs boot, agent
+// vsock handshake). After a successful warm-up, the Jailer asks
+// Firecracker to take a memory + state snapshot under
+// snapshots/<fnKey>/ and the next invocation restores from it. This
+// turns subsequent cold-starts into a sub-100ms restore-and-resume.
 //
 // Layout under DataDir:
 //
@@ -35,6 +40,10 @@ import (
 //	    kernel/vmlinux
 //	    rootfs/<name>.ext4
 //	  fns/<project>/<name>/code.tar       <- user upload
+//	  snapshots/<project>-<name>/         <- saved warm snapshot
+//	    state.bin
+//	    mem.bin
+//	    code.img                          <- frozen code drive
 //	  jail/<uid>/                         <- per-invocation chroot
 //	    vm.json
 //	    fc.sock                           <- firecracker API socket
@@ -45,9 +54,7 @@ type Jailer struct {
 	dataDir   string
 	templates map[string]Template
 	mu        sync.Mutex
-	// snapshots maps function key -> path to a saved snapshot. Populated by
-	// snapshot()/restore() (currently TODO).
-	snapshots map[string]string
+	snapshots map[string]string // function key -> snapshot dir
 }
 
 // NewJailer wires a jailer-backed runtime.
@@ -57,6 +64,7 @@ func NewJailer(dataDir string) (*Jailer, error) {
 	}
 	for _, dir := range []string{
 		filepath.Join(dataDir, "jail"),
+		filepath.Join(dataDir, "snapshots"),
 		filepath.Join(dataDir, "templates", "kernel"),
 		filepath.Join(dataDir, "templates", "rootfs"),
 	} {
@@ -68,11 +76,25 @@ func NewJailer(dataDir string) (*Jailer, error) {
 	for _, t := range DefaultTemplates(filepath.Join(dataDir, "templates")) {
 		tmpls[t.Name] = t
 	}
-	return &Jailer{
+	j := &Jailer{
 		dataDir:   dataDir,
 		templates: tmpls,
 		snapshots: map[string]string{},
-	}, nil
+	}
+	// Re-discover any previously-persisted snapshots so a server restart
+	// keeps warm-start eligibility.
+	if entries, err := os.ReadDir(filepath.Join(dataDir, "snapshots")); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			dir := filepath.Join(dataDir, "snapshots", e.Name())
+			if _, err := os.Stat(filepath.Join(dir, "state.bin")); err == nil {
+				j.snapshots[e.Name()] = dir
+			}
+		}
+	}
+	return j, nil
 }
 
 // Templates returns the registered rootfs templates.
@@ -102,7 +124,9 @@ func (j *Jailer) Remove(_ context.Context, fn *store.Function) error {
 }
 
 // Invoke spins up a microVM, ships the code drive, talks to the in-guest
-// agent over vsock, and tears it down. Snapshot/restore is a TODO.
+// agent over vsock, and tears it down. After the first successful cold
+// invocation we take a memory + state snapshot so subsequent calls can
+// restore-and-resume in tens of milliseconds.
 func (j *Jailer) Invoke(ctx context.Context, fn *store.Function, req *wasm.InvokeRequest) (*wasm.InvokeResponse, error) {
 	tplName := fn.Handler
 	if tplName == "" {
@@ -132,7 +156,15 @@ func (j *Jailer) Invoke(ctx context.Context, fn *store.Function, req *wasm.Invok
 	if err := os.MkdirAll(chroot, 0o750); err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(chroot)
+	// Whether to keep the chroot after we return. We flip this to true if
+	// we successfully take a snapshot so future restore() calls can find
+	// the original vsock UDS path the snapshot recorded.
+	keepChroot := false
+	defer func() {
+		if !keepChroot {
+			_ = os.RemoveAll(chroot)
+		}
+	}()
 
 	codePath := filepath.Join(j.fnDir(fn), "code.tar")
 	codeImg := filepath.Join(chroot, "code.img")
@@ -200,12 +232,13 @@ func (j *Jailer) Invoke(ctx context.Context, fn *store.Function, req *wasm.Invok
 	// Build and send the request envelope.
 	mode, _ := fn.Env["MODE"]
 	preq := &protocol.Request{
-		Method:  req.Method,
-		Path:    req.Path,
-		Headers: req.Headers,
-		Body:    req.Body,
-		Env:     mergeEnv(fn.Env, req.Env),
-		Mode:    mode,
+		Method:      req.Method,
+		Path:        req.Path,
+		Headers:     req.Headers,
+		Body:        req.Body,
+		Env:         mergeEnv(fn.Env, req.Env),
+		SecretFiles: req.SecretFiles,
+		Mode:        mode,
 	}
 	if preq.Env == nil {
 		preq.Env = map[string]string{}
@@ -239,6 +272,171 @@ func (j *Jailer) Invoke(ctx context.Context, fn *store.Function, req *wasm.Invok
 		log.With("fn", fn.Meta.Name, "err", presp.Error).Warn("firecracker: agent reported error")
 	}
 
+	resp := &wasm.InvokeResponse{
+		Status:  status,
+		Headers: h,
+		Body:    presp.Body,
+		Logs:    presp.Logs,
+		Elapsed: elapsed,
+	}
+
+	// Best-effort: take a snapshot once per function so the next
+	// invocation can warm-start. Failures here only cost us future
+	// warm-start eligibility; the current request has already been
+	// served successfully.
+	if _, has := j.lookupSnapshot(fn); !has {
+		if serr := j.snapshot(ctx, fn, apiSock, chroot); serr == nil {
+			keepChroot = true
+		} else {
+			log.With("err", serr, "fn", fn.Meta.Name).Debug("firecracker: snapshot failed")
+		}
+	}
+	return resp, nil
+}
+
+func (j *Jailer) Close() error { return nil }
+
+func (j *Jailer) fnDir(fn *store.Function) string {
+	return filepath.Join(j.dataDir, "fns", fn.Meta.Project, fn.Meta.Name)
+}
+
+// snapshot pauses the running Firecracker VM and writes a state + memory
+// pair to <dataDir>/snapshots/<fnKey>/. The chroot path is recorded
+// alongside so restore() can reuse the same vsock UDS path the snapshot
+// recorded internally.
+func (j *Jailer) snapshot(ctx context.Context, fn *store.Function, apiSock, chroot string) error {
+	snapDir := filepath.Join(j.dataDir, "snapshots", fnKey(fn))
+	if err := os.MkdirAll(snapDir, 0o750); err != nil {
+		return err
+	}
+	statePath := filepath.Join(snapDir, "state.bin")
+	memPath := filepath.Join(snapDir, "mem.bin")
+
+	if err := fcAPI(ctx, apiSock, http.MethodPatch, "/vm", map[string]string{"state": "Paused"}); err != nil {
+		return fmt.Errorf("pause vm: %w", err)
+	}
+	if err := fcAPI(ctx, apiSock, http.MethodPut, "/snapshot/create", map[string]any{
+		"snapshot_type": "Full",
+		"snapshot_path": statePath,
+		"mem_file_path": memPath,
+	}); err != nil {
+		return fmt.Errorf("create snapshot: %w", err)
+	}
+	meta := map[string]string{"chroot": chroot}
+	mb, _ := json.Marshal(meta)
+	if err := os.WriteFile(filepath.Join(snapDir, "meta.json"), mb, 0o640); err != nil {
+		return err
+	}
+	j.mu.Lock()
+	j.snapshots[fnKey(fn)] = snapDir
+	j.mu.Unlock()
+	return nil
+}
+
+// restore loads a previously-saved snapshot, resumes the VM, and runs
+// the invocation against the still-listening agent. Any failure makes
+// Invoke fall back to a cold boot.
+func (j *Jailer) restore(ctx context.Context, fn *store.Function, snapDir string, req *wasm.InvokeRequest) (*wasm.InvokeResponse, error) {
+	var meta struct {
+		Chroot string `json:"chroot"`
+	}
+	mb, err := os.ReadFile(filepath.Join(snapDir, "meta.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read snapshot meta: %w", err)
+	}
+	if err := json.Unmarshal(mb, &meta); err != nil {
+		return nil, err
+	}
+	if meta.Chroot == "" {
+		return nil, errors.New("snapshot meta missing chroot")
+	}
+	if _, err := os.Stat(meta.Chroot); err != nil {
+		// Original chroot is gone; cold-boot is required.
+		return nil, fmt.Errorf("snapshot chroot missing: %w", err)
+	}
+	apiSock := filepath.Join(meta.Chroot, "fc-restore.sock")
+	_ = os.Remove(apiSock)
+
+	cctx, cancel := context.WithTimeout(ctx, fnTimeout(fn)+10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(cctx, "firecracker", "--api-sock", apiSock)
+	cmd.Stderr = newPrefixWriter("[firecracker-restore] ")
+	cmd.Stdout = cmd.Stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start firecracker: %w", err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			done := make(chan struct{})
+			go func() { _, _ = cmd.Process.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}
+		}
+	}()
+	if err := waitForFile(cctx, apiSock, 3*time.Second); err != nil {
+		return nil, fmt.Errorf("api socket never appeared: %w", err)
+	}
+	if err := fcAPI(cctx, apiSock, http.MethodPut, "/snapshot/load", map[string]any{
+		"snapshot_path":         filepath.Join(snapDir, "state.bin"),
+		"mem_file_path":         filepath.Join(snapDir, "mem.bin"),
+		"enable_diff_snapshots": false,
+		"resume_vm":             true,
+	}); err != nil {
+		return nil, fmt.Errorf("load snapshot: %w", err)
+	}
+
+	vsockUDS := filepath.Join(meta.Chroot, "v.sock")
+	conn, err := dialAgent(cctx, vsockUDS+"_"+strconv.Itoa(protocol.VsockPort), 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("connect to restored agent: %w", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(fnTimeout(fn)))
+
+	mode, _ := fn.Env["MODE"]
+	preq := &protocol.Request{
+		Method:      req.Method,
+		Path:        req.Path,
+		Headers:     req.Headers,
+		Body:        req.Body,
+		Env:         mergeEnv(fn.Env, req.Env),
+		SecretFiles: req.SecretFiles,
+		Mode:        mode,
+	}
+	if preq.Env == nil {
+		preq.Env = map[string]string{}
+	}
+	preq.Env["SELFCLOUD_TIMEOUT_MS"] = strconv.Itoa(fnTimeoutMS(fn))
+
+	start := time.Now()
+	if err := protocol.WriteFrame(conn, preq); err != nil {
+		return nil, err
+	}
+	var presp protocol.Response
+	if err := protocol.ReadFrame(conn, &presp); err != nil {
+		return nil, err
+	}
+	elapsed := time.Since(start)
+
+	h := http.Header{}
+	for k, vs := range presp.Headers {
+		for _, v := range vs {
+			h.Add(k, v)
+		}
+	}
+	if h.Get("content-type") == "" {
+		h.Set("content-type", "application/octet-stream")
+	}
+	status := presp.Status
+	if status == 0 {
+		status = 200
+	}
 	return &wasm.InvokeResponse{
 		Status:  status,
 		Headers: h,
@@ -248,33 +446,68 @@ func (j *Jailer) Invoke(ctx context.Context, fn *store.Function, req *wasm.Invok
 	}, nil
 }
 
-func (j *Jailer) Close() error { return nil }
-
-func (j *Jailer) fnDir(fn *store.Function) string {
-	return filepath.Join(j.dataDir, "fns", fn.Meta.Project, fn.Meta.Name)
-}
-
-// snapshot creates a Firecracker snapshot for fn. NOT IMPLEMENTED yet —
-// hook is here so Invoke can later try restore() before falling back to a
-// cold boot.
-//
-//nolint:unused // wired for future warm-start work
-func (j *Jailer) snapshot(_ context.Context, _ *store.Function) error {
-	return errors.New("snapshot: not implemented")
-}
-
-// restore loads a previously-saved snapshot and runs the invocation
-// against it. NOT IMPLEMENTED yet.
-func (j *Jailer) restore(_ context.Context, _ *store.Function, _ string, _ *wasm.InvokeRequest) (*wasm.InvokeResponse, error) {
-	return nil, errors.New("restore: not implemented")
-}
-
 func (j *Jailer) lookupSnapshot(fn *store.Function) (string, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	s, ok := j.snapshots[fnKey(fn)]
 	return s, ok
 }
+
+// fcAPI is a tiny client for the Firecracker REST API exposed over its
+// per-VM unix socket. Methods we use today: PATCH /vm, PUT /snapshot/*.
+func fcAPI(ctx context.Context, sock, method, path string, body any) error {
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, "http://localhost"+path, rd)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set("accept", "application/json")
+	cli := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				d := net.Dialer{}
+				return d.DialContext(ctx, "unix", sock)
+			},
+		},
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("firecracker %s %s: %s: %s", method, path, resp.Status, string(b))
+	}
+	return nil
+}
+
+// waitForFile polls until path exists or the context expires.
+func waitForFile(ctx context.Context, path string, max time.Duration) error {
+	deadline := time.Now().Add(max)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for %s", path)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 
 func fnKey(fn *store.Function) string { return fn.Meta.Project + "/" + fn.Meta.Name }
 

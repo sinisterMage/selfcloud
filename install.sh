@@ -132,19 +132,36 @@ ensure_dirs() {
 # --- binary download --------------------------------------------------
 
 download_binary() {
-  local url
+  local url sumurl
   if [ "$VERSION" = "latest" ]; then
     url="$RELEASE_HOST/releases/latest/download/selfcloud-linux-$ARCH"
   else
     url="$RELEASE_HOST/releases/download/$VERSION/selfcloud-linux-$ARCH"
   fi
+  sumurl="${url}.sha256"
   log "downloading $url"
-  local tmp
-  tmp="$(mktemp -d)/selfcloud"
+  local tmpdir tmp sumtmp
+  tmpdir="$(mktemp -d)"
+  tmp="$tmpdir/selfcloud"
+  sumtmp="$tmpdir/selfcloud.sha256"
   if ! curl -fsSL "$url" -o "$tmp"; then
     warn "download failed; trying CDN fallback (https://get.selfcloud.dev/${VERSION}/selfcloud-linux-${ARCH})"
     curl -fsSL "https://get.selfcloud.dev/${VERSION}/selfcloud-linux-${ARCH}" -o "$tmp" \
       || fail "could not download selfcloud binary; please install manually."
+  fi
+  # Fetch the matching .sha256 and verify. Skip on hard 404 (older
+  # releases without checksums) but never silently accept on a partial
+  # / corrupted body.
+  if curl -fsSL "$sumurl" -o "$sumtmp" 2>/dev/null; then
+    local expected actual
+    expected="$(awk '{print $1}' "$sumtmp")"
+    actual="$(sha256sum "$tmp" | awk '{print $1}')"
+    if [ "$expected" != "$actual" ]; then
+      fail "sha256 mismatch: expected $expected, got $actual"
+    fi
+    log "sha256 verified ($actual)"
+  else
+    warn "no .sha256 published for this version; skipping verification"
   fi
   run "chmod +x $tmp"
   run "$SUDO mv $tmp $BIN_DIR/selfcloud"
@@ -157,14 +174,20 @@ write_unit() {
   [ "$USE_SYSTEMD" = 1 ] || return
   log "writing systemd unit"
   local unit
-  unit="$($BIN_DIR/selfcloud install --render-only --binary $BIN_DIR/selfcloud --data-dir $DATA_DIR --api-addr $API_ADDR)"
+  # All unit content (User=, Group=, --data-dir, --api-addr) is rendered
+  # by `selfcloud install` itself. Do NOT sed-patch the result; one
+  # source of truth lives in internal/installer.RenderSystemd.
+  unit="$($BIN_DIR/selfcloud install --render-only \
+    --binary $BIN_DIR/selfcloud \
+    --data-dir $DATA_DIR \
+    --api-addr $API_ADDR \
+    --user $SVC_USER \
+    --group $SVC_USER)"
   if [ "$DRY_RUN" = 1 ]; then
     printf '+ write /etc/systemd/system/selfcloud.service:\n%s\n' "$unit"
     return
   fi
   printf '%s' "$unit" | $SUDO tee /etc/systemd/system/selfcloud.service >/dev/null
-  $SUDO sed -i "s/^User=.*/User=$SVC_USER/" /etc/systemd/system/selfcloud.service
-  $SUDO sed -i "s/^Group=.*/Group=$SVC_USER/" /etc/systemd/system/selfcloud.service
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable --now selfcloud
 }
@@ -175,17 +198,31 @@ ensure_containerd
 ensure_user
 ensure_dirs
 download_binary
+
+# Run a preflight via the freshly-installed binary so the operator gets
+# an immediate, structured "yes everything looks ok" before systemd is
+# touched. The doctor exits non-zero on missing required pieces.
+log "running preflight checks"
+$BIN_DIR/selfcloud doctor --preflight --data-dir "$DATA_DIR" || fail "preflight failed; see above"
+
 write_unit
 
 if [ -n "$JOIN_ADDR" ] && [ -n "$JOIN_TOKEN" ]; then
   log "joining cluster at $JOIN_ADDR"
-  run "$BIN_DIR/selfcloud join --leader $JOIN_ADDR --token $JOIN_TOKEN"
+  # Pass --data-dir so the handshake file lands wherever the unit is
+  # configured to read state, not just at the default /var/lib/selfcloud.
+  run "$BIN_DIR/selfcloud join --leader $JOIN_ADDR --token $JOIN_TOKEN --data-dir $DATA_DIR"
 fi
 
-# Wait briefly for the bootstrap token file to appear, then surface it.
+# Wait for /readyz to report 200, then surface the bootstrap token.
+# /readyz only flips green once store + master.key + api + garage +
+# reconciler (and raft, in multi-node) have all reported ready, so the
+# operator never sees a "dashboard up but token unavailable" gap.
 if [ "$USE_SYSTEMD" = 1 ] && [ -z "$JOIN_ADDR" ]; then
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -s "$DATA_DIR/bootstrap-token" ] && break
+  for _ in $(seq 1 60); do
+    if curl -fsSk "https://127.0.0.1:${API_ADDR##*:}/readyz" >/dev/null 2>&1; then
+      break
+    fi
     sleep 1
   done
   echo
@@ -195,7 +232,7 @@ if [ "$USE_SYSTEMD" = 1 ] && [ -z "$JOIN_ADDR" ]; then
   if [ -s "$DATA_DIR/bootstrap-token" ]; then
     echo "  Bootstrap token: $($SUDO cat "$DATA_DIR/bootstrap-token")"
   else
-    echo "  Bootstrap token: see /var/log/selfcloud or systemctl status selfcloud"
+    echo "  Bootstrap token: (already initialized; use the dashboard)"
   fi
   echo "=========================================================="
 fi

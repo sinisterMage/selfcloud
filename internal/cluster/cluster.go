@@ -1,6 +1,8 @@
-// Package cluster manages multi-node membership: generating join tokens on
-// the leader, gossipping liveness, and giving the API a clean handle to add
-// or remove voters from Raft.
+// Package cluster manages multi-node membership: generating join tokens
+// on the leader and giving the API a clean handle to add or remove
+// voters from Raft. Liveness is tracked via the per-node heartbeat goroutine
+// in cmd/selfcloud (it refreshes Node.LastSeenAt every 15s); gossip is
+// not currently implemented and not required given the heartbeat model.
 package cluster
 
 import (

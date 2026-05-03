@@ -108,7 +108,29 @@ func (m *Manager) CreateBootstrapToken(ctx context.Context) (string, error) {
 	return plain, nil
 }
 
-// ConsumeBootstrapToken atomically validates and clears the bootstrap token.
+// VerifyBootstrapToken validates a presented bootstrap token without
+// consuming it. Used by the first-run wizard to authenticate the
+// initialize request; the wizard only marks Initialized + clears the
+// token after the rest of setup (admin user, default project, initial
+// API token) succeeds. Lets a failed wizard run be retried with the
+// same token.
+func (m *Manager) VerifyBootstrapToken(ctx context.Context, plain string) error {
+	cfg, err := m.s.GetCluster(ctx)
+	if err != nil {
+		return err
+	}
+	if cfg.BootstrapToken == "" {
+		return ErrInvalidCredentials
+	}
+	if HashToken(plain) != cfg.BootstrapToken {
+		return ErrInvalidCredentials
+	}
+	return nil
+}
+
+// ConsumeBootstrapToken validates and atomically clears the bootstrap
+// token, marking the cluster initialized. Callers must only invoke this
+// after every other side-effect of setup has succeeded.
 func (m *Manager) ConsumeBootstrapToken(ctx context.Context, plain string) error {
 	cfg, err := m.s.GetCluster(ctx)
 	if err != nil {

@@ -60,6 +60,7 @@ func (s *Server) routes() http.Handler {
 
 	auth.HandleFunc("GET /api/v1/projects/{project}/access-keys", s.handleListAccessKeys)
 	auth.HandleFunc("POST /api/v1/projects/{project}/access-keys", s.handleCreateAccessKey)
+	auth.HandleFunc("GET /api/v1/projects/{project}/access-keys/{name}", s.handleGetAccessKey)
 	auth.HandleFunc("DELETE /api/v1/projects/{project}/access-keys/{name}", s.handleDeleteAccessKey)
 
 	auth.HandleFunc("GET /api/v1/projects/{project}/functions", s.handleListFunctions)

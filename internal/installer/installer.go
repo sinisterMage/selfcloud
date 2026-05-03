@@ -69,11 +69,16 @@ func EnsureTLS(dir, host string) (certFile, keyFile string, err error) {
 	return certFile, keyFile, nil
 }
 
-// SystemdUnit renders the selfcloud systemd service file content.
+// UnitParams describes the values RenderSystemd substitutes into the
+// unit template. This is the single source of truth for the systemd
+// unit; both `selfcloud install` and `install.sh` go through it. The
+// installer script must NOT post-process the result with sed.
 type UnitParams struct {
 	BinaryPath string
 	DataDir    string
 	APIAddr    string
+	RaftAddr   string
+	JoinAddr   string
 	User       string
 	Group      string
 }
@@ -86,7 +91,7 @@ Requires=containerd.service
 
 [Service]
 Type=simple
-ExecStart={{.BinaryPath}} server --data-dir {{.DataDir}} --api-addr {{.APIAddr}}
+ExecStart={{.BinaryPath}} server --data-dir {{.DataDir}} --api-addr {{.APIAddr}}{{.RaftFlag}}{{.JoinFlag}}
 Restart=on-failure
 RestartSec=2s
 User={{.User}}
@@ -114,10 +119,20 @@ func RenderSystemd(p UnitParams) string {
 	if p.Group == "" {
 		p.Group = p.User
 	}
+	raftFlag := ""
+	if p.RaftAddr != "" {
+		raftFlag = " --raft-addr " + p.RaftAddr
+	}
+	joinFlag := ""
+	if p.JoinAddr != "" {
+		joinFlag = " --join-addr " + p.JoinAddr
+	}
 	out := systemdTemplate
 	out = replace(out, "{{.BinaryPath}}", p.BinaryPath)
 	out = replace(out, "{{.DataDir}}", p.DataDir)
 	out = replace(out, "{{.APIAddr}}", p.APIAddr)
+	out = replace(out, "{{.RaftFlag}}", raftFlag)
+	out = replace(out, "{{.JoinFlag}}", joinFlag)
 	out = replace(out, "{{.User}}", p.User)
 	out = replace(out, "{{.Group}}", p.Group)
 	return out

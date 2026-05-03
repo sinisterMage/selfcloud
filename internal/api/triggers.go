@@ -80,12 +80,21 @@ func (s *Server) handleFunctionInvoke(w http.ResponseWriter, r *http.Request) {
 	wasm.CopyResponse(w, resp)
 }
 
+// Invoke is the exported invoker used by the cron scheduler and any other
+// in-process subsystem (event rules, builds, etc.) that needs to invoke a
+// function the same way an external HTTP caller would. It satisfies
+// wasm.Invoker.
+func (s *Server) Invoke(ctx context.Context, f *store.Function, req *wasm.InvokeRequest) (*wasm.InvokeResponse, error) {
+	return s.invoke(ctx, f, req)
+}
+
 // invoke routes to the right runtime for a function. It also takes
-// care of resolving secret:// references in f.Env and emitting
+// care of resolving secret:// references in f.Env, projecting
+// f.SecretMounts as env vars or guest-side files, and emitting
 // function.invoked / function.error lifecycle events on the bus.
 func (s *Server) invoke(ctx context.Context, f *store.Function, req *wasm.InvokeRequest) (*wasm.InvokeResponse, error) {
-	// Resolve secret-backed env vars.
 	if s.secrets != nil {
+		// Resolve secret-backed env vars.
 		if resolved, err := s.secrets.Resolve(ctx, f.Meta.Project, f.Env); err == nil {
 			merged := map[string]string{}
 			for k, v := range resolved {
@@ -95,6 +104,27 @@ func (s *Server) invoke(ctx context.Context, f *store.Function, req *wasm.Invoke
 				merged[k] = v
 			}
 			req.Env = merged
+		}
+		// Project f.SecretMounts. EnvName entries fold into Env;
+		// MountPath entries become guest-side files the runtime is
+		// responsible for staging.
+		for _, sm := range f.SecretMounts {
+			pt, err := s.secrets.Reveal(ctx, f.Meta.Project, sm.Secret)
+			if err != nil {
+				continue
+			}
+			if sm.EnvName != "" {
+				if req.Env == nil {
+					req.Env = map[string]string{}
+				}
+				req.Env[sm.EnvName] = pt
+			}
+			if sm.MountPath != "" {
+				if req.SecretFiles == nil {
+					req.SecretFiles = map[string][]byte{}
+				}
+				req.SecretFiles[sm.MountPath] = []byte(pt)
+			}
 		}
 	}
 

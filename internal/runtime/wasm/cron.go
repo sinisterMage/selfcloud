@@ -54,6 +54,16 @@ func (s *CronScheduler) WithBus(b CronEmitter) *CronScheduler {
 	return s
 }
 
+// SetInvoker swaps the invoker. Used by cmd/selfcloud/server.go to point
+// the scheduler at the API server's Invoke method (which resolves secrets
+// and picks the right runtime) instead of hitting wasm directly.
+func (s *CronScheduler) SetInvoker(inv Invoker) *CronScheduler {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.invoke = inv
+	return s
+}
+
 // Start runs an initial pass and then subscribes to events.
 func (s *CronScheduler) Start(ctx context.Context) {
 	s.c.Start()
@@ -125,7 +135,14 @@ func (s *CronScheduler) sync(f *store.Function) {
 				Body:    nil,
 				Env:     f.Env,
 			}
-			if _, err := s.invoke.Invoke(context.Background(), f, req); err != nil {
+			s.mu.Lock()
+			inv := s.invoke
+			s.mu.Unlock()
+			if inv == nil {
+				log.With("fn", f.Meta.Name).Warn("cron: no invoker configured; skipping")
+				return
+			}
+			if _, err := inv.Invoke(context.Background(), f, req); err != nil {
 				log.With("err", err, "fn", f.Meta.Name).Warn("cron invoke failed")
 			}
 		})

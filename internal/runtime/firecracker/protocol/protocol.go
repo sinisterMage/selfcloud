@@ -32,6 +32,13 @@ type Request struct {
 	Headers map[string][]string `json:"headers,omitempty"`
 	Body    []byte              `json:"body,omitempty"`
 	Env     map[string]string   `json:"env,omitempty"`
+	// SecretFiles maps the desired in-guest path to the file's bytes.
+	// The agent writes each entry under /run/selfcloud/secrets/ before
+	// invoking user code; both the host-supplied absolute path and the
+	// canonical /run/selfcloud/secrets/<basename> location resolve to
+	// the same file (the latter via symlink) so functions can rely on
+	// either convention.
+	SecretFiles map[string][]byte `json:"secretFiles,omitempty"`
 	// Mode mirrors the function manifest: "stdio" (default) writes the
 	// request body to the child's stdin and reads the response body from
 	// stdout; "http" forwards via 127.0.0.1:8080.

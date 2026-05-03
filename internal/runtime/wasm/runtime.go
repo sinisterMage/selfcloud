@@ -35,12 +35,21 @@ import (
 var ErrFunctionNotReady = errors.New("function not ready")
 
 // InvokeRequest is what the trigger router hands the runtime.
+//
+// SecretFiles is a map of guest-relative path -> plaintext bytes. The
+// API server's invoke pipeline populates it from fn.SecretMounts (file-
+// mode entries); runtimes are expected to surface the bytes to the guest
+// at the given paths. wazero stages them under /secrets/<basename> via
+// WithDirMount; firecracker drops them into /run/selfcloud/secrets/
+// inside the rootfs before invoking. Env-mode SecretMounts are folded
+// into Env directly (above) before the runtime sees the request.
 type InvokeRequest struct {
-	Method  string
-	Path    string
-	Headers http.Header
-	Body    []byte
-	Env     map[string]string
+	Method      string
+	Path        string
+	Headers     http.Header
+	Body        []byte
+	Env         map[string]string
+	SecretFiles map[string][]byte
 }
 
 // InvokeResponse is what the runtime returns.

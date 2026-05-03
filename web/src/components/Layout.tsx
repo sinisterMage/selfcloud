@@ -12,11 +12,15 @@ import {
   LogOut,
   Moon,
   Network,
+  Plus,
   Settings,
   Sun,
+  Trash2,
+  X,
   Zap,
 } from "lucide-react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { cn } from "../lib/cn";
 import { useTheme } from "../lib/theme";
 import { useProject } from "../lib/project";
@@ -37,11 +41,13 @@ const items = [
 const COLLAPSE_KEY = "selfcloud.sidebar";
 
 export default function Layout({ onLogout, userEmail }: { onLogout: () => void; userEmail?: string }) {
+  const qc = useQueryClient();
   const { theme, toggle } = useTheme();
   const { project, setProject } = useProject();
   const [collapsed, setCollapsed] = useState<boolean>(() =>
     typeof window === "undefined" ? false : window.localStorage.getItem(COLLAPSE_KEY) === "1"
   );
+  const [showProjects, setShowProjects] = useState(false);
 
   useEffect(() => {
     window.localStorage.setItem(COLLAPSE_KEY, collapsed ? "1" : "0");
@@ -114,6 +120,13 @@ export default function Layout({ onLogout, userEmail }: { onLogout: () => void; 
                 <option value={project}>{project}</option>
               )}
             </select>
+            <button
+              className="btn-ghost"
+              title="Manage projects"
+              onClick={() => setShowProjects(true)}
+            >
+              <Plus size={14} />
+            </button>
           </div>
           <div className="flex items-center gap-2">
             <button className="btn-ghost" onClick={toggle} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}>
@@ -129,6 +142,125 @@ export default function Layout({ onLogout, userEmail }: { onLogout: () => void; 
           <Outlet />
         </div>
       </main>
+
+      {showProjects && (
+        <ProjectsManager
+          current={project}
+          projects={projects.data ?? []}
+          onClose={() => setShowProjects(false)}
+          onSelect={(name) => setProject(name)}
+          onMutated={() => qc.invalidateQueries({ queryKey: ["projects"] })}
+        />
+      )}
+    </div>
+  );
+}
+
+function ProjectsManager({
+  current,
+  projects,
+  onClose,
+  onSelect,
+  onMutated,
+}: {
+  current: string;
+  projects: Project[];
+  onClose: () => void;
+  onSelect: (name: string) => void;
+  onMutated: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [displayName, setDisplayName] = useState("");
+
+  const create = useMutation({
+    mutationFn: () =>
+      api.post<Project>("/api/v1/projects", {
+        meta: { name: name.trim() },
+        displayName: displayName.trim() || undefined,
+      }),
+    onSuccess: (p) => {
+      toast.success(`Created ${p.meta.name}`);
+      onSelect(p.meta.name);
+      onMutated();
+      setName("");
+      setDisplayName("");
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "create failed"),
+  });
+
+  const remove = useMutation({
+    mutationFn: (n: string) => api.del(`/api/v1/projects/${n}`),
+    onSuccess: (_d, n) => {
+      toast.success(`Deleted ${n}`);
+      if (n === current) onSelect("default");
+      onMutated();
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "delete failed"),
+  });
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="card max-w-lg w-full p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-semibold">Projects</h2>
+          <button className="btn-ghost" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        <div className="overflow-hidden rounded-md border border-border">
+          <table className="w-full text-sm">
+            <thead className="bg-elevated text-muted">
+              <tr>
+                <th className="px-3 py-2 text-left">Name</th>
+                <th className="px-3 py-2 text-left">Display</th>
+                <th className="px-3 py-2 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {projects.map((p) => (
+                <tr key={p.meta.name} className="border-t border-border">
+                  <td className="px-3 py-2 font-mono">{p.meta.name}</td>
+                  <td className="px-3 py-2 text-muted">{p.displayName ?? "—"}</td>
+                  <td className="px-3 py-2 text-right">
+                    {p.meta.name !== "default" && (
+                      <button
+                        className="btn-ghost"
+                        onClick={() => remove.mutate(p.meta.name)}
+                        title={`Delete ${p.meta.name}`}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <input
+            className="input"
+            placeholder="name (lowercase, no spaces)"
+            value={name}
+            onChange={(e) => setName(e.target.value.replace(/[^a-z0-9-]/g, "").slice(0, 32))}
+          />
+          <input
+            className="input"
+            placeholder="display name (optional)"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+          />
+        </div>
+        <div className="flex justify-end">
+          <button
+            className="btn-primary"
+            onClick={() => create.mutate()}
+            disabled={create.isPending || name.trim().length < 2}
+          >
+            <Plus size={14} /> {create.isPending ? "Creating..." : "Create project"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

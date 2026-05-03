@@ -31,6 +31,11 @@ type Config struct {
 	Bootstrap      bool
 	ContainerdSock string
 	UIDistDir      string
+	// ForceMasterKeyRotation lets the operator start the server even
+	// when <data-dir>/master.key has a different fingerprint than
+	// ClusterConfig.SecretFingerprint. Without it we refuse to start so
+	// existing encrypted secrets aren't silently rendered unreadable.
+	ForceMasterKeyRotation bool
 }
 
 // Default returns sensible defaults for a single-node deployment.

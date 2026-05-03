@@ -296,6 +296,9 @@ func handleConn(ctx context.Context, conn net.Conn, mf *manifest, childMu *sync.
 		writeErr(conn, fmt.Sprintf("read request: %v", err))
 		return
 	}
+	if err := stageSecretFiles(&req); err != nil {
+		logf("stage secrets: %v", err)
+	}
 	mode := req.Mode
 	if mode == "" {
 		mode = mf.Mode
@@ -306,6 +309,39 @@ func handleConn(ctx context.Context, conn net.Conn, mf *manifest, childMu *sync.
 	default:
 		serveStdio(ctx, conn, &req, mf)
 	}
+}
+
+// stageSecretFiles materialises req.SecretFiles into the guest filesystem.
+// Each entry is written to its requested absolute path AND symlinked
+// from /run/selfcloud/secrets/<basename> so user code can rely on
+// either convention. /run is a tmpfs so the bytes never hit disk.
+func stageSecretFiles(req *protocol.Request) error {
+	if len(req.SecretFiles) == 0 {
+		return nil
+	}
+	const stage = "/run/selfcloud/secrets"
+	if err := os.MkdirAll(stage, 0o700); err != nil {
+		return err
+	}
+	for guestPath, data := range req.SecretFiles {
+		if guestPath == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(guestPath), 0o700); err == nil {
+			_ = os.WriteFile(guestPath, data, 0o400)
+		}
+		base := filepath.Base(guestPath)
+		if base == "" || base == "/" || base == "." {
+			continue
+		}
+		canonical := filepath.Join(stage, base)
+		_ = os.Remove(canonical)
+		if err := os.Symlink(guestPath, canonical); err != nil {
+			// Symlink can fail in some rootfs setups; fall back to a copy.
+			_ = os.WriteFile(canonical, data, 0o400)
+		}
+	}
+	return nil
 }
 
 func serveStdio(ctx context.Context, conn net.Conn, req *protocol.Request, mf *manifest) {
