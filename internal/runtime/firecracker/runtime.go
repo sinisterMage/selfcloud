@@ -29,6 +29,12 @@ var ErrUnsupported = errors.New("firecracker not available on this host")
 // can use them interchangeably.
 type Runtime = wasm.Runtime
 
+// TemplateLister is implemented by runtimes that know about rootfs
+// templates. The API surfaces these via GET /api/v1/runtime/firecracker/templates.
+type TemplateLister interface {
+	Templates() []Template
+}
+
 // Stub returns canned responses identifying itself as the firecracker stub.
 type Stub struct {
 	mu    sync.RWMutex
@@ -36,6 +42,9 @@ type Stub struct {
 }
 
 func NewStub() *Stub { return &Stub{funcs: map[string][]byte{}} }
+
+// Templates returns an empty list — the stub doesn't manage rootfs.
+func (s *Stub) Templates() []Template { return nil }
 
 func k(fn *store.Function) string { return fn.Meta.Project + "/" + fn.Meta.Name }
 

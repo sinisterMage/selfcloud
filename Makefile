@@ -50,6 +50,32 @@ terraform-provider:
 	cd terraform-provider-selfcloud && \
 		$(GO) build -trimpath -ldflags '-s -w' -o ../$(BIN_DIR)/terraform-provider-selfcloud .
 
+# fc-agent is the in-guest init process baked into Firecracker rootfs
+# templates. Built statically (no CGO) and stripped so it stays small.
+.PHONY: firecracker-agent
+firecracker-agent:
+	mkdir -p $(BIN_DIR)
+	CGO_ENABLED=0 GOOS=linux $(GO) build -trimpath -ldflags '-s -w' \
+		-o $(BIN_DIR)/fc-agent ./internal/runtime/firecracker/agent
+
+# Build the default rootfs templates (node, python, go) and download the
+# Firecracker-compatible kernel into the data dir. Override DATA_DIR or
+# TEMPLATES to control the targets.
+DATA_DIR  ?= ./data
+TEMPLATES ?= node-22:node:22-alpine python-3.12:python:3.12-alpine go-1.23:golang:1.23-alpine
+
+.PHONY: firecracker-templates
+firecracker-templates: firecracker-agent
+	@for spec in $(TEMPLATES); do \
+		name=$${spec%%:*}; rest=$${spec#*:}; base=$$rest; \
+		echo "==> building $$name from $$base"; \
+		scripts/build-rootfs.sh \
+			--name "$$name" \
+			--base "$$base" \
+			--agent $(BIN_DIR)/fc-agent \
+			--out $(DATA_DIR)/firecracker/templates; \
+	done
+
 .PHONY: test
 test:
 	$(GO) test -race -count=1 ./...

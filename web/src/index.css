@@ -2,8 +2,39 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+:root,
+:root.dark {
   color-scheme: dark;
+  --c-bg: 10 14 20;
+  --c-surface: 15 20 26;
+  --c-elevated: 22 27 34;
+  --c-border: 30 36 44;
+  --c-fg: 230 237 243;
+  --c-muted: 125 133 144;
+  --c-accent: 88 166 255;
+  --c-success: 63 185 80;
+  --c-warning: 210 153 34;
+  --c-danger: 248 81 73;
+  --toast-bg: rgb(22 27 34);
+  --toast-fg: rgb(230 237 243);
+  --toast-border: rgb(30 36 44);
+}
+
+:root.light {
+  color-scheme: light;
+  --c-bg: 248 250 252;
+  --c-surface: 255 255 255;
+  --c-elevated: 241 245 249;
+  --c-border: 219 226 234;
+  --c-fg: 15 23 42;
+  --c-muted: 100 116 139;
+  --c-accent: 37 99 235;
+  --c-success: 22 163 74;
+  --c-warning: 202 138 4;
+  --c-danger: 220 38 38;
+  --toast-bg: rgb(255 255 255);
+  --toast-fg: rgb(15 23 42);
+  --toast-border: rgb(219 226 234);
 }
 
 html,
@@ -14,12 +45,14 @@ body,
 
 body {
   font-family: theme("fontFamily.sans");
+  background-color: rgb(var(--c-bg));
+  color: rgb(var(--c-fg));
   -webkit-font-smoothing: antialiased;
 }
 
 ::selection {
-  background: theme("colors.accent");
-  color: theme("colors.bg");
+  background: rgb(var(--c-accent));
+  color: rgb(var(--c-bg));
 }
 
 @layer components {
@@ -34,9 +67,14 @@ body {
   .btn-danger {
     @apply btn border-danger/30 bg-danger/10 text-danger hover:bg-danger/20;
   }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-2 py-1.5 text-sm
+      text-muted hover:text-fg hover:bg-elevated transition-colors;
+  }
   .input {
     @apply w-full rounded-md border border-border bg-surface px-3 py-1.5 text-sm
-      placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent/40;
+      placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-accent/40
+      text-fg;
   }
   .card {
     @apply rounded-lg border border-border bg-surface;
@@ -52,5 +90,19 @@ body {
   }
   .badge-danger {
     @apply badge text-danger border-danger/30 bg-danger/10;
+  }
+  .skeleton {
+    @apply rounded bg-elevated relative overflow-hidden;
+    background-image: linear-gradient(
+      90deg,
+      transparent,
+      rgb(var(--c-border) / 0.6),
+      transparent
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+  .kbd {
+    @apply inline-flex items-center rounded border border-border bg-elevated px-1.5 py-0.5 text-[10px] font-mono text-muted;
   }
 }

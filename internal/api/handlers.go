@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,10 @@ import (
 	"github.com/selfcloud/selfcloud/internal/store"
 	"github.com/selfcloud/selfcloud/internal/version"
 )
+
+// tokenReader is the random source for webhook tokens; tests can swap
+// it out via package-level assignment if they need determinism.
+var tokenReader = rand.Reader
 
 // ----- helpers ---------------------------------------------------------
 
@@ -511,10 +517,62 @@ func (s *Server) handlePutFunction(w http.ResponseWriter, r *http.Request) {
 	if f.Runtime == "" {
 		f.Runtime = store.FunctionRuntimeWasm
 	}
+	if f.Source.Type == "" {
+		if f.Source.Git != nil {
+			f.Source.Type = "git"
+		} else {
+			f.Source.Type = "upload"
+		}
+	}
+
+	// On creation, mint a unique webhook token for git sources so we
+	// don't depend on the user's own URL to be unguessable.
+	wasNew := false
+	if f.Meta.UID == "" {
+		wasNew = true
+	} else if cur, err := s.store.GetFunction(r.Context(), f.Meta.Project, f.Meta.Name); err == nil && cur != nil {
+		// Preserve existing webhook token / source ref / build pointer
+		// so a generic update-from-list call doesn't lose them.
+		if f.SourceRef == "" {
+			f.SourceRef = cur.SourceRef
+		}
+		if f.LatestBuild == "" {
+			f.LatestBuild = cur.LatestBuild
+		}
+		if f.Source.Git != nil && cur.Source.Git != nil && f.Source.Git.WebhookToken == "" {
+			f.Source.Git.WebhookToken = cur.Source.Git.WebhookToken
+		}
+	}
+	if f.Source.Git != nil && f.Source.Git.WebhookToken == "" {
+		t, err := mintWebhookToken()
+		if err != nil {
+			httpError(w, 500, err.Error())
+			return
+		}
+		f.Source.Git.WebhookToken = t
+	}
+
 	if err := s.store.PutFunction(r.Context(), &f); mapStoreErr(w, err) {
 		return
 	}
+
+	// If this is the first time we're saving a git-backed function and a
+	// builder is wired up, kick off an initial build so the user sees
+	// build logs without an extra click.
+	if wasNew && f.Source.Git != nil && s.builder != nil {
+		_, _ = s.builder.Trigger(r.Context(), &f, "create")
+	}
 	writeJSON(w, 201, f)
+}
+
+// mintWebhookToken returns a 16-byte hex token suitable for use as a
+// per-function webhook URL segment.
+func mintWebhookToken() (string, error) {
+	var b [16]byte
+	if _, err := tokenReader.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func (s *Server) handleGetFunction(w http.ResponseWriter, r *http.Request) {
@@ -592,17 +650,45 @@ func (s *Server) handleInvokeFunction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	subPath := r.URL.Query().Get("path")
+	if subPath == "" {
+		subPath = "/"
+	}
 	req := &wasm.InvokeRequest{
 		Method:  r.Method,
-		Path:    r.URL.Path,
+		Path:    subPath,
 		Headers: r.Header,
 		Body:    body,
 		Env:     f.Env,
 	}
+	start := time.Now()
 	resp, err := s.invoke(r.Context(), f, req)
+	dur := time.Since(start)
+	rec := invocationRecord{
+		At:     start.UTC(),
+		Method: req.Method,
+		Path:   req.Path,
+		DurMS:  dur.Milliseconds(),
+		BodyKB: len(body) / 1024,
+	}
 	if err != nil {
+		rec.Status = 500
+		rec.Error = err.Error()
+		s.invocations.record(f.Meta.Project+"/"+f.Meta.Name, rec)
 		httpError(w, 500, err.Error())
 		return
 	}
+	rec.Status = resp.Status
+	if len(resp.Logs) > 0 {
+		rec.LogsTail = tailString(resp.Logs, 256)
+	}
+	s.invocations.record(f.Meta.Project+"/"+f.Meta.Name, rec)
 	wasm.CopyResponse(w, resp)
+}
+
+func tailString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n:]
 }

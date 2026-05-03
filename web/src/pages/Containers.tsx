@@ -1,30 +1,46 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Play, Plus, Square, Trash2 } from "lucide-react";
+import { Boxes, Play, Plus, Square, Trash2 } from "lucide-react";
+import { toast } from "sonner";
 import { api } from "../lib/api";
+import { useProject } from "../lib/project";
 import type { Container } from "../lib/types";
-
-const project = "default";
+import { SkeletonRows } from "../components/Skeleton";
+import EmptyState from "../components/EmptyState";
 
 export default function ContainersPage() {
   const qc = useQueryClient();
+  const { project } = useProject();
   const list = useQuery<Container[]>({
-    queryKey: ["containers"],
+    queryKey: ["containers", project],
     queryFn: () => api.get<Container[]>(`/api/v1/projects/${project}/containers`).catch(() => []),
   });
   const [open, setOpen] = useState(false);
 
   const start = useMutation({
     mutationFn: (name: string) => api.post(`/api/v1/projects/${project}/containers/${name}/start`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["containers"] }),
+    onSuccess: (_, name) => {
+      toast.success(`Started ${name}`);
+      qc.invalidateQueries({ queryKey: ["containers", project] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "start failed"),
   });
   const stop = useMutation({
     mutationFn: (name: string) => api.post(`/api/v1/projects/${project}/containers/${name}/stop`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["containers"] }),
+    onSuccess: (_, name) => {
+      toast.success(`Stopped ${name}`);
+      qc.invalidateQueries({ queryKey: ["containers", project] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "stop failed"),
   });
   const remove = useMutation({
     mutationFn: (name: string) => api.del(`/api/v1/projects/${project}/containers/${name}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["containers"] }),
+    onSuccess: (_, name) => {
+      toast.success(`Deleted ${name}`);
+      qc.invalidateQueries({ queryKey: ["containers", project] });
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "delete failed"),
   });
 
   return (
@@ -51,27 +67,58 @@ export default function ContainersPage() {
             </tr>
           </thead>
           <tbody>
-            {(list.data ?? []).map((c) => (
-              <tr key={c.meta.uid} className="border-t border-border">
-                <td className="px-4 py-2 font-mono">{c.meta.name}</td>
-                <td className="px-4 py-2 font-mono text-muted">{c.image}</td>
-                <td className="px-4 py-2">
-                  <span className={c.status.phase === "Running" ? "badge-success" : "badge"}>
-                    {c.status.phase || "—"}
-                  </span>
-                </td>
-                <td className="px-4 py-2 text-muted">{c.nodeId || "self"}</td>
-                <td className="px-4 py-2">
-                  <div className="flex justify-end gap-2">
-                    <button className="btn" onClick={() => start.mutate(c.meta.name)}><Play size={14} /></button>
-                    <button className="btn" onClick={() => stop.mutate(c.meta.name)}><Square size={14} /></button>
-                    <button className="btn-danger" onClick={() => remove.mutate(c.meta.name)}><Trash2 size={14} /></button>
-                  </div>
+            {list.isLoading && <SkeletonRows rows={3} cols={5} />}
+            {!list.isLoading &&
+              (list.data ?? []).map((c) => (
+                <tr key={c.meta.uid} className="border-t border-border hover:bg-elevated/40">
+                  <td className="px-4 py-2 font-mono">
+                    <Link className="hover:text-accent" to={`/containers/${c.meta.name}`}>
+                      {c.meta.name}
+                    </Link>
+                  </td>
+                  <td className="px-4 py-2 font-mono text-muted">{c.image}</td>
+                  <td className="px-4 py-2">
+                    <span className={c.status.phase === "Running" ? "badge-success" : "badge"}>
+                      {c.status.phase || "—"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2 text-muted">{c.nodeId || "self"}</td>
+                  <td className="px-4 py-2">
+                    <div className="flex justify-end gap-2">
+                      <button className="btn" title="Start" onClick={() => start.mutate(c.meta.name)}>
+                        <Play size={14} />
+                      </button>
+                      <button className="btn" title="Stop" onClick={() => stop.mutate(c.meta.name)}>
+                        <Square size={14} />
+                      </button>
+                      <button
+                        className="btn-danger"
+                        title="Delete"
+                        onClick={() => {
+                          if (confirm(`Delete container ${c.meta.name}?`)) remove.mutate(c.meta.name);
+                        }}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            {!list.isLoading && !list.data?.length && (
+              <tr>
+                <td colSpan={5}>
+                  <EmptyState
+                    icon={Boxes}
+                    title="No containers yet"
+                    description="Run any OCI image from Docker Hub or your private registry. Bridge networking and port publishing are wired up automatically."
+                    action={
+                      <button className="btn-primary" onClick={() => setOpen(true)}>
+                        <Plus size={14} /> New container
+                      </button>
+                    }
+                  />
                 </td>
               </tr>
-            ))}
-            {!list.data?.length && (
-              <tr><td colSpan={5} className="px-4 py-12 text-center text-muted">No containers yet.</td></tr>
             )}
           </tbody>
         </table>
@@ -84,15 +131,14 @@ export default function ContainersPage() {
 
 function NewContainerDialog({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
+  const { project } = useProject();
   const [name, setName] = useState("");
   const [image, setImage] = useState("docker.io/library/nginx:alpine");
   const [hostPort, setHostPort] = useState(8080);
   const [containerPort, setContainerPort] = useState(80);
-  const [error, setError] = useState<string | null>(null);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    setError(null);
     try {
       await api.post(`/api/v1/projects/${project}/containers`, {
         meta: { project, name },
@@ -100,15 +146,16 @@ function NewContainerDialog({ onClose }: { onClose: () => void }) {
         ports: [{ host: hostPort, container: containerPort, protocol: "tcp" }],
         restartPolicy: "Always",
       });
-      qc.invalidateQueries({ queryKey: ["containers"] });
+      toast.success(`Created ${name}`);
+      qc.invalidateQueries({ queryKey: ["containers", project] });
       onClose();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "create failed");
+      toast.error(e instanceof Error ? e.message : "create failed");
     }
   }
 
   return (
-    <div className="fixed inset-0 bg-bg/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div className="fixed inset-0 bg-bg/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
       <form onSubmit={submit} className="card w-full max-w-md p-6 space-y-4">
         <h2 className="font-semibold">New container</h2>
         <div className="space-y-1">
@@ -129,7 +176,6 @@ function NewContainerDialog({ onClose }: { onClose: () => void }) {
             <input className="input" type="number" value={containerPort} onChange={(e) => setContainerPort(Number(e.target.value))} />
           </div>
         </div>
-        {error && <div className="text-sm text-danger">{error}</div>}
         <div className="flex justify-end gap-2">
           <button type="button" className="btn" onClick={onClose}>Cancel</button>
           <button type="submit" className="btn-primary">Create</button>

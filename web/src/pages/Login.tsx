@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Layers } from "lucide-react";
+import { toast } from "sonner";
 import { api } from "../lib/api";
 
 export default function LoginPage({ onLogin }: { onLogin: (token: string) => void }) {
@@ -15,8 +16,11 @@ export default function LoginPage({ onLogin }: { onLogin: (token: string) => voi
     try {
       const { token } = await api.post<{ token: string }>("/api/v1/auth/login", { email, password }, { auth: false });
       onLogin(token);
+      toast.success("Welcome back");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "login failed");
+      const msg = e instanceof Error ? e.message : "login failed";
+      setError(msg);
+      toast.error(msg);
     } finally {
       setBusy(false);
     }

@@ -53,6 +53,10 @@ func (s *Server) routes() http.Handler {
 	auth.HandleFunc("POST /api/v1/projects/{project}/buckets", s.handlePutBucket)
 	auth.HandleFunc("GET /api/v1/projects/{project}/buckets/{name}", s.handleGetBucket)
 	auth.HandleFunc("DELETE /api/v1/projects/{project}/buckets/{name}", s.handleDeleteBucket)
+	auth.HandleFunc("GET /api/v1/projects/{project}/buckets/{name}/objects", s.handleListObjects)
+	auth.HandleFunc("PUT /api/v1/projects/{project}/buckets/{name}/objects", s.handlePutObject)
+	auth.HandleFunc("GET /api/v1/projects/{project}/buckets/{name}/object", s.handleGetObject)
+	auth.HandleFunc("DELETE /api/v1/projects/{project}/buckets/{name}/object", s.handleDeleteObject)
 
 	auth.HandleFunc("GET /api/v1/projects/{project}/access-keys", s.handleListAccessKeys)
 	auth.HandleFunc("POST /api/v1/projects/{project}/access-keys", s.handleCreateAccessKey)
@@ -64,6 +68,34 @@ func (s *Server) routes() http.Handler {
 	auth.HandleFunc("DELETE /api/v1/projects/{project}/functions/{name}", s.handleDeleteFunction)
 	auth.HandleFunc("POST /api/v1/projects/{project}/functions/{name}/code", s.handleUploadFunctionCode)
 	auth.HandleFunc("POST /api/v1/projects/{project}/functions/{name}/invoke", s.handleInvokeFunction)
+	auth.HandleFunc("GET /api/v1/projects/{project}/functions/{name}/invoke", s.handleInvokeFunction)
+	auth.HandleFunc("PUT /api/v1/projects/{project}/functions/{name}/invoke", s.handleInvokeFunction)
+	auth.HandleFunc("DELETE /api/v1/projects/{project}/functions/{name}/invoke", s.handleInvokeFunction)
+	auth.HandleFunc("PATCH /api/v1/projects/{project}/functions/{name}/invoke", s.handleInvokeFunction)
+	auth.HandleFunc("GET /api/v1/projects/{project}/functions/{name}/invocations", s.handleListFunctionInvocations)
+	auth.HandleFunc("GET /api/v1/projects/{project}/functions/{name}/builds", s.handleListBuilds)
+	auth.HandleFunc("POST /api/v1/projects/{project}/functions/{name}/builds", s.handleTriggerBuild)
+	auth.HandleFunc("GET /api/v1/projects/{project}/functions/{name}/builds/{id}", s.handleGetBuild)
+	auth.HandleFunc("GET /api/v1/projects/{project}/functions/{name}/builds/{id}/logs/ws", s.handleBuildLogsWS)
+
+	auth.HandleFunc("GET /api/v1/runtime/firecracker/templates", s.handleListFirecrackerTemplates)
+
+	// Secrets (project-scoped, encrypted at rest).
+	auth.HandleFunc("GET /api/v1/projects/{project}/secrets", s.handleListSecrets)
+	auth.HandleFunc("POST /api/v1/projects/{project}/secrets", s.handlePutSecret)
+	auth.HandleFunc("GET /api/v1/projects/{project}/secrets/{name}", s.handleGetSecret)
+	auth.HandleFunc("DELETE /api/v1/projects/{project}/secrets/{name}", s.handleDeleteSecret)
+	auth.HandleFunc("POST /api/v1/projects/{project}/secrets/{name}/reveal", s.handleRevealSecret)
+
+	// Event rules + log timeline.
+	auth.HandleFunc("GET /api/v1/projects/{project}/event-rules", s.handleListEventRules)
+	auth.HandleFunc("POST /api/v1/projects/{project}/event-rules", s.handlePutEventRule)
+	auth.HandleFunc("GET /api/v1/projects/{project}/event-rules/{name}", s.handleGetEventRule)
+	auth.HandleFunc("DELETE /api/v1/projects/{project}/event-rules/{name}", s.handleDeleteEventRule)
+	auth.HandleFunc("GET /api/v1/projects/{project}/event-rules/{name}/deliveries", s.handleListDeliveries)
+	auth.HandleFunc("POST /api/v1/projects/{project}/event-rules/{name}/test", s.handleTestRule)
+	auth.HandleFunc("GET /api/v1/projects/{project}/events", s.handleListEvents)
+	auth.HandleFunc("GET /api/v1/projects/{project}/events/ws", s.handleEventsWS)
 
 	auth.HandleFunc("GET /api/v1/cluster", s.handleGetCluster)
 	auth.HandleFunc("GET /api/v1/cluster/nodes", s.handleListNodes)
@@ -80,6 +112,11 @@ func (s *Server) routes() http.Handler {
 	// Function HTTP triggers (unauthenticated by default; functions can
 	// gate themselves).
 	mux.HandleFunc("/fn/", s.handleFunctionInvoke)
+
+	// Git push-to-deploy webhooks. Each git-backed function gets a
+	// unique token at creation time; HMAC verification (GitHub-style or
+	// generic bearer) gates the build trigger.
+	mux.HandleFunc("POST /webhooks/git/{token}", s.handleGitWebhook)
 
 	// S3 reverse proxy is wired up by Phase 3.
 	mux.HandleFunc("/s3/", s.handleS3Proxy)

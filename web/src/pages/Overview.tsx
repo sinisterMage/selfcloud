@@ -1,9 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { Boxes, HardDrive, Network, Zap } from "lucide-react";
+import { Link } from "react-router-dom";
 import { api } from "../lib/api";
+import { useProject } from "../lib/project";
 import type { Container, Bucket, FunctionRecord, Node } from "../lib/types";
-
-const project = "default";
+import { Skeleton } from "../components/Skeleton";
 
 function useResources<T>(path: string) {
   return useQuery<T[]>({
@@ -13,16 +14,17 @@ function useResources<T>(path: string) {
 }
 
 export default function OverviewPage() {
+  const { project } = useProject();
   const containers = useResources<Container>(`/api/v1/projects/${project}/containers`);
   const buckets = useResources<Bucket>(`/api/v1/projects/${project}/buckets`);
   const fns = useResources<FunctionRecord>(`/api/v1/projects/${project}/functions`);
   const nodes = useResources<Node>(`/api/v1/cluster/nodes`);
 
   const cards = [
-    { label: "Containers", icon: Boxes, n: containers.data?.length ?? 0 },
-    { label: "Buckets", icon: HardDrive, n: buckets.data?.length ?? 0 },
-    { label: "Functions", icon: Zap, n: fns.data?.length ?? 0 },
-    { label: "Nodes", icon: Network, n: Math.max(1, nodes.data?.length ?? 0) },
+    { label: "Containers", icon: Boxes, n: containers.data?.length ?? 0, to: "/containers" },
+    { label: "Buckets", icon: HardDrive, n: buckets.data?.length ?? 0, to: "/buckets" },
+    { label: "Functions", icon: Zap, n: fns.data?.length ?? 0, to: "/functions" },
+    { label: "Nodes", icon: Network, n: Math.max(1, nodes.data?.length ?? 0), to: "/nodes" },
   ];
 
   return (
@@ -33,7 +35,11 @@ export default function OverviewPage() {
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {cards.map((c) => (
-          <div key={c.label} className="card p-5 flex items-center gap-4">
+          <Link
+            key={c.label}
+            to={c.to}
+            className="card p-5 flex items-center gap-4 hover:bg-elevated/50 transition-colors"
+          >
             <div className="rounded-lg bg-accent/10 p-3 text-accent">
               <c.icon size={20} />
             </div>
@@ -41,36 +47,62 @@ export default function OverviewPage() {
               <div className="text-3xl font-semibold">{c.n}</div>
               <div className="text-muted text-sm">{c.label}</div>
             </div>
-          </div>
+          </Link>
         ))}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="card p-5">
           <div className="font-medium mb-3">Recent containers</div>
-          {(containers.data ?? []).slice(0, 5).map((c) => (
-            <div key={c.meta.uid} className="flex items-center justify-between py-2 border-b border-border last:border-b-0">
-              <div>
-                <div className="font-mono text-sm">{c.meta.name}</div>
-                <div className="text-muted text-xs">{c.image}</div>
-              </div>
-              <span className={c.status.phase === "Running" ? "badge-success" : "badge"}>{c.status.phase || "—"}</span>
+          {containers.isLoading && (
+            <div className="space-y-2">
+              <Skeleton className="h-5 w-full" />
+              <Skeleton className="h-5 w-full" />
             </div>
-          ))}
-          {!containers.data?.length && <div className="text-muted text-sm">Nothing yet. Create your first container from the Containers tab.</div>}
+          )}
+          {!containers.isLoading &&
+            (containers.data ?? []).slice(0, 5).map((c) => (
+              <Link
+                key={c.meta.uid}
+                to={`/containers/${c.meta.name}`}
+                className="flex items-center justify-between py-2 border-b border-border last:border-b-0 hover:text-accent"
+              >
+                <div>
+                  <div className="font-mono text-sm">{c.meta.name}</div>
+                  <div className="text-muted text-xs">{c.image}</div>
+                </div>
+                <span className={c.status.phase === "Running" ? "badge-success" : "badge"}>{c.status.phase || "—"}</span>
+              </Link>
+            ))}
+          {!containers.isLoading && !containers.data?.length && (
+            <div className="text-muted text-sm">Nothing yet. Create your first container from the Containers tab.</div>
+          )}
         </div>
         <div className="card p-5">
           <div className="font-medium mb-3">Recent functions</div>
-          {(fns.data ?? []).slice(0, 5).map((f) => (
-            <div key={f.meta.uid} className="flex items-center justify-between py-2 border-b border-border last:border-b-0">
-              <div>
-                <div className="font-mono text-sm">{f.meta.name}</div>
-                <div className="text-muted text-xs">{f.runtime}</div>
-              </div>
-              <span className="badge">{f.triggers?.length ?? 0} triggers</span>
+          {fns.isLoading && (
+            <div className="space-y-2">
+              <Skeleton className="h-5 w-full" />
+              <Skeleton className="h-5 w-full" />
             </div>
-          ))}
-          {!fns.data?.length && <div className="text-muted text-sm">Deploy a Wasm or Firecracker function from the Functions tab.</div>}
+          )}
+          {!fns.isLoading &&
+            (fns.data ?? []).slice(0, 5).map((f) => (
+              <Link
+                key={f.meta.uid}
+                to={`/functions/${f.meta.name}`}
+                className="flex items-center justify-between py-2 border-b border-border last:border-b-0 hover:text-accent"
+              >
+                <div>
+                  <div className="font-mono text-sm">{f.meta.name}</div>
+                  <div className="text-muted text-xs">{f.runtime}</div>
+                </div>
+                <span className="badge">{f.triggers?.length ?? 0} triggers</span>
+              </Link>
+            ))}
+          {!fns.isLoading && !fns.data?.length && (
+            <div className="text-muted text-sm">Deploy a Wasm or Firecracker function from the Functions tab.</div>
+          )}
         </div>
       </div>
     </div>

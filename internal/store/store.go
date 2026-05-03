@@ -19,6 +19,8 @@ var rootBuckets = []string{
 	"projects", "nodes", "containers", "functions",
 	"buckets", "accesskeys", "users", "tokens", "cluster",
 	"meta",
+	"secrets", "eventrules", "builds", "eventlog",
+	"deliveries", "webhookqueue",
 }
 
 // Store is the persistent state machine. It is backed by BoltDB and intended
@@ -236,13 +238,17 @@ type projectScoped interface {
 
 func (m *Meta) getMeta() *Meta { return m }
 
-func (c *Container) getMeta() *Meta { return &c.Meta }
-func (f *Function) getMeta() *Meta  { return &f.Meta }
-func (b *Bucket) getMeta() *Meta    { return &b.Meta }
-func (a *AccessKey) getMeta() *Meta { return &a.Meta }
-func (n *Node) getMeta() *Meta      { return &n.Meta }
-func (u *User) getMeta() *Meta      { return &u.Meta }
-func (t *Token) getMeta() *Meta     { return &t.Meta }
+func (c *Container) getMeta() *Meta        { return &c.Meta }
+func (f *Function) getMeta() *Meta         { return &f.Meta }
+func (b *Bucket) getMeta() *Meta           { return &b.Meta }
+func (a *AccessKey) getMeta() *Meta        { return &a.Meta }
+func (n *Node) getMeta() *Meta             { return &n.Meta }
+func (u *User) getMeta() *Meta             { return &u.Meta }
+func (t *Token) getMeta() *Meta            { return &t.Meta }
+func (s *Secret) getMeta() *Meta           { return &s.Meta }
+func (e *EventRule) getMeta() *Meta        { return &e.Meta }
+func (b *Build) getMeta() *Meta            { return &b.Meta }
+func (d *WebhookDelivery) getMeta() *Meta  { return &d.Meta }
 
 func (s *Store) putScoped(bucket string, kind Kind, v projectScoped) error {
 	m := v.getMeta()
@@ -602,4 +608,260 @@ func (s *Store) PutCluster(_ context.Context, c *ClusterConfig) error {
 	}
 	s.emit(Event{Kind: KindCluster, Op: "put", Name: "config", Value: c})
 	return nil
+}
+
+// ----------------------- Secrets ------------------------
+
+func (s *Store) PutSecret(_ context.Context, sec *Secret) error {
+	return s.putScoped("secrets", KindSecret, sec)
+}
+
+func (s *Store) GetSecret(_ context.Context, project, name string) (*Secret, error) {
+	var sec Secret
+	if err := s.get("secrets", keyFor(project, name), &sec); err != nil {
+		return nil, err
+	}
+	return &sec, nil
+}
+
+func (s *Store) ListSecrets(_ context.Context, project string) ([]Secret, error) {
+	var prefix []byte
+	if project != "" {
+		prefix = []byte(project + "/")
+	}
+	raws, err := s.list("secrets", prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Secret, 0, len(raws))
+	for _, r := range raws {
+		var sec Secret
+		if err := json.Unmarshal(r, &sec); err == nil {
+			// strip the encrypted payload from list responses; only the
+			// reveal endpoint should ever return ciphertext.
+			sec.Nonce = nil
+			sec.Ciphertext = nil
+			out = append(out, sec)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteSecret(_ context.Context, project, name string) error {
+	if err := s.del("secrets", keyFor(project, name)); err != nil {
+		return err
+	}
+	s.emit(Event{Kind: KindSecret, Op: "delete", Project: project, Name: name})
+	return nil
+}
+
+// ----------------------- EventRules ---------------------
+
+func (s *Store) PutEventRule(_ context.Context, r *EventRule) error {
+	return s.putScoped("eventrules", KindEventRule, r)
+}
+
+func (s *Store) GetEventRule(_ context.Context, project, name string) (*EventRule, error) {
+	var r EventRule
+	if err := s.get("eventrules", keyFor(project, name), &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+func (s *Store) ListEventRules(_ context.Context, project string) ([]EventRule, error) {
+	var prefix []byte
+	if project != "" {
+		prefix = []byte(project + "/")
+	}
+	raws, err := s.list("eventrules", prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EventRule, 0, len(raws))
+	for _, r := range raws {
+		var er EventRule
+		if err := json.Unmarshal(r, &er); err == nil {
+			if er.Action.Webhook != nil {
+				er.Action.Webhook.Secret = ""
+			}
+			out = append(out, er)
+		}
+	}
+	return out, nil
+}
+
+// ListAllEventRules returns rules across every project. Used by the event
+// dispatcher which needs to iterate all enabled rules on each emit.
+func (s *Store) ListAllEventRules(_ context.Context) ([]EventRule, error) {
+	raws, err := s.list("eventrules", nil)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EventRule, 0, len(raws))
+	for _, r := range raws {
+		var er EventRule
+		if err := json.Unmarshal(r, &er); err == nil {
+			out = append(out, er)
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteEventRule(_ context.Context, project, name string) error {
+	if err := s.del("eventrules", keyFor(project, name)); err != nil {
+		return err
+	}
+	s.emit(Event{Kind: KindEventRule, Op: "delete", Project: project, Name: name})
+	return nil
+}
+
+// ----------------------- Builds -------------------------
+
+func (s *Store) PutBuild(_ context.Context, b *Build) error {
+	return s.putScoped("builds", KindBuild, b)
+}
+
+func (s *Store) GetBuild(_ context.Context, project, name string) (*Build, error) {
+	var b Build
+	if err := s.get("builds", keyFor(project, name), &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+// ListBuilds returns every build for a single function, sorted newest
+// first by CreatedAt.
+func (s *Store) ListBuilds(_ context.Context, project, fn string) ([]Build, error) {
+	prefix := []byte(project + "/")
+	raws, err := s.list("builds", prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Build, 0, len(raws))
+	for _, r := range raws {
+		var b Build
+		if err := json.Unmarshal(r, &b); err == nil && b.FunctionRef == fn {
+			out = append(out, b)
+		}
+	}
+	// reverse-chronological
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
+func (s *Store) DeleteBuild(_ context.Context, project, name string) error {
+	if err := s.del("builds", keyFor(project, name)); err != nil {
+		return err
+	}
+	s.emit(Event{Kind: KindBuild, Op: "delete", Project: project, Name: name})
+	return nil
+}
+
+// ----------------------- Event log -----------------------
+
+// AppendEvent persists an EventRecord to the bounded per-project log. The
+// key is `<project>/<rfc3339nano>-<uid>` so list returns chronological
+// order with stable iteration.
+func (s *Store) AppendEvent(_ context.Context, rec *EventRecord) error {
+	if rec.UID == "" {
+		rec.UID = newUID()
+	}
+	if rec.At.IsZero() {
+		rec.At = time.Now().UTC()
+	}
+	project := rec.Project
+	if project == "" {
+		project = "default"
+	}
+	key := []byte(project + "/" + rec.At.UTC().Format(time.RFC3339Nano) + "-" + rec.UID)
+	return s.put("eventlog", key, rec)
+}
+
+// ListEvents returns up to limit events for a project, newest first.
+// Caller can pass since="" to get the most recent records.
+func (s *Store) ListEvents(_ context.Context, project string, limit int) ([]EventRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	prefix := []byte(project + "/")
+	raws, err := s.list("eventlog", prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EventRecord, 0, len(raws))
+	for _, r := range raws {
+		var rec EventRecord
+		if err := json.Unmarshal(r, &rec); err == nil {
+			out = append(out, rec)
+		}
+	}
+	// reverse-chronological
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// TrimEvents removes the oldest events for a project so the per-project
+// log doesn't grow unbounded. Called periodically by the events sink.
+func (s *Store) TrimEvents(_ context.Context, project string, keep int) error {
+	if keep <= 0 {
+		keep = 10000
+	}
+	prefix := []byte(project + "/")
+	raws, err := s.list("eventlog", prefix)
+	if err != nil {
+		return err
+	}
+	if len(raws) <= keep {
+		return nil
+	}
+	// keys are sorted ascending; need to delete the oldest ones.
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket([]byte("eventlog"))
+		c := bkt.Cursor()
+		toDelete := len(raws) - keep
+		i := 0
+		for k, _ := c.Seek(prefix); k != nil && hasPrefix(k, prefix) && i < toDelete; k, _ = c.Next() {
+			if err := bkt.Delete(k); err != nil {
+				return err
+			}
+			i++
+		}
+		return nil
+	})
+}
+
+// ----------------------- Webhook deliveries -------------
+
+func (s *Store) PutDelivery(_ context.Context, d *WebhookDelivery) error {
+	return s.putScoped("deliveries", KindEventRule, d)
+}
+
+func (s *Store) ListDeliveries(_ context.Context, project, rule string) ([]WebhookDelivery, error) {
+	prefix := []byte(project + "/")
+	raws, err := s.list("deliveries", prefix)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WebhookDelivery, 0, len(raws))
+	for _, r := range raws {
+		var d WebhookDelivery
+		if err := json.Unmarshal(r, &d); err == nil && (rule == "" || d.Rule == rule) {
+			out = append(out, d)
+		}
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	if len(out) > 200 {
+		out = out[:200]
+	}
+	return out, nil
 }

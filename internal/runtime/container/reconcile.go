@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
@@ -10,15 +11,33 @@ import (
 	"github.com/selfcloud/selfcloud/internal/store"
 )
 
+// EventEmitter is the optional bus the reconciler emits lifecycle events
+// to. Implementations live in the events package; this avoids importing
+// it directly here so the runtime stays lightweight.
+type EventEmitter interface {
+	Emit(ev store.EventRecord)
+}
+
+// SecretResolver is the optional secret reference resolver. When set,
+// the reconciler resolves "secret://name" values in container Env and
+// SecretMounts before calling rt.Start.
+type SecretResolver interface {
+	Resolve(ctx context.Context, project string, in map[string]string) (map[string]string, error)
+	Reveal(ctx context.Context, project, name string) (string, error)
+}
+
 // Reconciler watches the desired-container set in the store and converges
 // the local runtime to match it. It tracks per-container in-memory state
 // (last attempt time, attempt count, last reconciled spec generation) so
 // that retries are bounded and store mutations from the reconciler itself
 // don't cause an event-driven hot loop.
 type Reconciler struct {
-	st  *store.Store
-	rt  Runtime
-	net *network.Manager
+	st      *store.Store
+	rt      Runtime
+	net     *network.Manager
+	bus     EventEmitter
+	secrets SecretResolver
+	dataDir string
 
 	mu    sync.Mutex
 	state map[string]*reconcileState
@@ -32,7 +51,8 @@ type reconcileState struct {
 	startedOK   bool
 }
 
-// NewReconciler wires the dependencies.
+// NewReconciler wires the dependencies. Bus and secrets are optional
+// and may be nil for environments that don't run them.
 func NewReconciler(st *store.Store, rt Runtime, net *network.Manager) *Reconciler {
 	return &Reconciler{
 		st:    st,
@@ -40,6 +60,21 @@ func NewReconciler(st *store.Store, rt Runtime, net *network.Manager) *Reconcile
 		net:   net,
 		state: map[string]*reconcileState{},
 	}
+}
+
+// WithBus attaches an event bus so lifecycle events are emitted on
+// container start/crash/stop.
+func (r *Reconciler) WithBus(b EventEmitter) *Reconciler {
+	r.bus = b
+	return r
+}
+
+// WithSecrets attaches a secret resolver so secret:// refs in env and
+// SecretMounts are resolved at start time.
+func (r *Reconciler) WithSecrets(s SecretResolver, dataDir string) *Reconciler {
+	r.secrets = s
+	r.dataDir = dataDir
+	return r
 }
 
 // Run is a blocking goroutine. It performs an initial pass, subscribes to
@@ -141,7 +176,50 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *store.Container, nodeI
 	}
 
 	st.lastAttempt = now
-	out, err := r.rt.Start(ctx, c)
+
+	// Resolve secrets in env vars + secret mounts before handing the
+	// container to the runtime. We work on a copy so the persisted
+	// resource never holds plaintext.
+	cWork := *c
+	if r.secrets != nil {
+		if resolved, err := r.secrets.Resolve(ctx, c.Meta.Project, c.Env); err == nil {
+			cWork.Env = resolved
+		} else {
+			log.With("err", err, "name", c.Meta.Name).Warn("reconcile: env secret resolve failed")
+		}
+		// Materialise file-mode secret mounts onto disk so the runtime's
+		// container factory can bind-mount them.
+		for _, sm := range c.SecretMounts {
+			if sm.MountPath == "" {
+				continue
+			}
+			pt, err := r.secrets.Reveal(ctx, c.Meta.Project, sm.Secret)
+			if err != nil {
+				log.With("err", err, "secret", sm.Secret).Warn("reconcile: secret mount resolve failed")
+				continue
+			}
+			if err := writeSecretFile(r.dataDir, &cWork, sm.MountPath, pt); err != nil {
+				log.With("err", err, "secret", sm.Secret).Warn("reconcile: secret mount write failed")
+			}
+		}
+		// Inject env-mode secret mounts.
+		if cWork.Env == nil {
+			cWork.Env = map[string]string{}
+		}
+		for _, sm := range c.SecretMounts {
+			if sm.EnvName == "" {
+				continue
+			}
+			pt, err := r.secrets.Reveal(ctx, c.Meta.Project, sm.Secret)
+			if err != nil {
+				log.With("err", err, "secret", sm.Secret).Warn("reconcile: secret env resolve failed")
+				continue
+			}
+			cWork.Env[sm.EnvName] = pt
+		}
+	}
+
+	out, err := r.rt.Start(ctx, &cWork)
 	if err != nil {
 		st.attempts++
 		st.startedOK = false
@@ -168,13 +246,38 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *store.Container, nodeI
 			}
 			_ = r.st.PutContainer(ctx, c)
 		}
+		if r.bus != nil {
+			r.bus.Emit(store.EventRecord{
+				Type:    "container.crash",
+				Project: c.Meta.Project,
+				Subject: c.Meta.Name,
+				Data: map[string]string{
+					"name":     c.Meta.Name,
+					"image":    c.Image,
+					"error":    err.Error(),
+					"attempts": fmtInt(st.attempts),
+				},
+			})
+		}
 		return
 	}
 
 	// Success.
+	wasRunning := st.startedOK
 	st.attempts = 0
 	st.startedOK = true
 	st.lastGen = c.Meta.Generation
+	if r.bus != nil && !wasRunning {
+		r.bus.Emit(store.EventRecord{
+			Type:    "container.start",
+			Project: c.Meta.Project,
+			Subject: c.Meta.Name,
+			Data: map[string]string{
+				"name":  c.Meta.Name,
+				"image": c.Image,
+			},
+		})
+	}
 
 	// Wire up port publishing.
 	if r.net != nil && out.IPAddress != "" {
@@ -192,4 +295,8 @@ func (r *Reconciler) reconcileOne(ctx context.Context, c *store.Container, nodeI
 		c.NodeID = nodeID
 		_ = r.st.PutContainer(ctx, c)
 	}
+}
+
+func fmtInt(i int) string {
+	return strconv.Itoa(i)
 }

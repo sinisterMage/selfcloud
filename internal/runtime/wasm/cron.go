@@ -20,12 +20,20 @@ type CronScheduler struct {
 	entries map[string]cron.EntryID
 	st      *store.Store
 	invoke  Invoker
+	bus     CronEmitter
 }
 
 // Invoker is satisfied by both wasm.Runtime and firecracker.Runtime; the
 // scheduler doesn't care which.
 type Invoker interface {
 	Invoke(ctx context.Context, fn *store.Function, req *InvokeRequest) (*InvokeResponse, error)
+}
+
+// CronEmitter is the optional event bus the scheduler emits a `cron`
+// event to on every fire, in addition to invoking the function. This
+// lets users hang multi-action rules off the same schedule.
+type CronEmitter interface {
+	Emit(ev store.EventRecord)
 }
 
 // NewCronScheduler builds a scheduler attached to st. invoke is called for
@@ -37,6 +45,13 @@ func NewCronScheduler(st *store.Store, invoke Invoker) *CronScheduler {
 		st:      st,
 		invoke:  invoke,
 	}
+}
+
+// WithBus attaches an event bus so each fire also publishes a `cron`
+// event for the rules engine.
+func (s *CronScheduler) WithBus(b CronEmitter) *CronScheduler {
+	s.bus = b
+	return s
 }
 
 // Start runs an initial pass and then subscribes to events.
@@ -90,7 +105,19 @@ func (s *CronScheduler) sync(f *store.Function) {
 			continue
 		}
 		f := f
-		id, err := s.c.AddFunc(t.Cron.Schedule, func() {
+		schedule := t.Cron.Schedule
+		id, err := s.c.AddFunc(schedule, func() {
+			if s.bus != nil {
+				s.bus.Emit(store.EventRecord{
+					Type:    "cron",
+					Project: f.Meta.Project,
+					Subject: f.Meta.Name,
+					Data: map[string]string{
+						"function": f.Meta.Name,
+						"schedule": schedule,
+					},
+				})
+			}
 			req := &InvokeRequest{
 				Method:  http.MethodPost,
 				Path:    "/cron",

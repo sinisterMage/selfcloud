@@ -16,7 +16,7 @@ Once the installer finishes it prints the dashboard URL and a one-time bootstrap
 |---|---|---|
 | Object storage (S3 API) | [Garage](https://garagehq.deuxfleurs.fr) | Single-node by default, expands to a multi-zone cluster from the dashboard |
 | Containers | containerd | OCI images, bridge networking, port publishing, logs, exec |
-| Wasm functions | Wasmtime (WASI Preview 2) | Sub-10ms cold starts, HTTP and cron triggers |
+| Wasm functions | wazero (pure Go, WASI Preview 1) | Sub-10ms cold starts, HTTP and cron triggers, language-agnostic stdin/stdout JSON ABI |
 | MicroVM functions | Firecracker | Any-language functions, snapshot/restore for warm starts |
 | Web dashboard | React + Vite + Tailwind | Embedded into the Go binary, no separate hosting needed |
 | Infra-as-Code | Terraform provider | Same REST API the dashboard uses |
@@ -37,7 +37,7 @@ selfCloud is a single static Go binary (`selfcloud`). One copy per machine. The 
 │                └────────┬─────────┘                      │
 │   ┌────────────┬────────┼────────┬───────────────┐       │
 │   ▼            ▼        ▼        ▼               ▼       │
-│ Garage     containerd  Wasmtime  Firecracker  Networking │
+│ Garage     containerd   wazero   Firecracker  Networking │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -50,7 +50,7 @@ internal/auth/                  local users, API tokens, bootstrap token
 internal/store/                 Raft FSM over BoltDB, resource CRUD
 internal/scheduler/             placement decisions
 internal/runtime/container/     containerd v2 client wrapper
-internal/runtime/wasm/          Wasmtime function runtime + warm pool
+internal/runtime/wasm/          wazero function runtime + warm pool
 internal/runtime/firecracker/   Firecracker microVM runtime
 internal/storage/garage/        Garage process supervisor + admin client
 internal/network/               bridge + nftables port publishing

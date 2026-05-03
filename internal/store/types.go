@@ -29,6 +29,10 @@ const (
 	KindUser      Kind = "user"
 	KindToken     Kind = "token"
 	KindCluster   Kind = "cluster"
+	KindSecret    Kind = "secret"
+	KindEventRule Kind = "eventrule"
+	KindBuild     Kind = "build"
+	KindEvent     Kind = "event"
 )
 
 // Meta is shared by every persisted resource.
@@ -118,10 +122,21 @@ type Container struct {
 	Env           map[string]string `json:"env,omitempty"`
 	Ports         []PortMapping     `json:"ports,omitempty"`
 	Volumes       []VolumeMount     `json:"volumes,omitempty"`
+	SecretMounts  []SecretMount     `json:"secretMounts,omitempty"`
 	RestartPolicy RestartPolicy     `json:"restartPolicy"`
 	Resources     ResourceLimits    `json:"resources,omitempty"`
 	NodeID        string            `json:"nodeId,omitempty"`
 	Status        ContainerStatus   `json:"status"`
+}
+
+// SecretMount is a binding from a project-scoped Secret onto a container
+// or function. If EnvName is set, the resolved plaintext is injected into
+// the environment as that variable. If MountPath is set, the plaintext is
+// written to a tmpfs file inside the container at that path.
+type SecretMount struct {
+	Secret    string `json:"secret"`
+	EnvName   string `json:"envName,omitempty"`
+	MountPath string `json:"mountPath,omitempty"`
 }
 
 // VolumeMount currently supports mounting an S3 bucket as a virtual file
@@ -163,15 +178,161 @@ type CronTrigger struct {
 }
 
 type Function struct {
-	Meta      Meta              `json:"meta"`
-	Runtime   FunctionRuntime   `json:"runtime"`
-	Handler   string            `json:"handler,omitempty"`
-	SourceRef string            `json:"sourceRef"` // sha256 content-addressed blob in DataDir/functions/blobs/<sha>
-	Triggers  []FunctionTrigger `json:"triggers"`
-	Env       map[string]string `json:"env,omitempty"`
-	MemoryMB  int               `json:"memoryMB,omitempty"`
-	TimeoutMS int               `json:"timeoutMs,omitempty"`
-	Status    Status            `json:"status"`
+	Meta         Meta              `json:"meta"`
+	Runtime      FunctionRuntime   `json:"runtime"`
+	Handler      string            `json:"handler,omitempty"`
+	SourceRef    string            `json:"sourceRef"` // sha256 content-addressed blob in DataDir/functions/blobs/<sha>
+	Source       FunctionSource    `json:"source,omitempty"`
+	Triggers     []FunctionTrigger `json:"triggers"`
+	Env          map[string]string `json:"env,omitempty"`
+	SecretMounts []SecretMount     `json:"secretMounts,omitempty"`
+	MemoryMB     int               `json:"memoryMB,omitempty"`
+	TimeoutMS    int               `json:"timeoutMs,omitempty"`
+	LatestBuild  string            `json:"latestBuild,omitempty"`
+	Status       Status            `json:"status"`
+}
+
+// FunctionSource describes where the code came from. Type is "upload" for
+// the legacy direct upload flow (default), or "git" for repos cloned and
+// built on the server.
+type FunctionSource struct {
+	Type string         `json:"type,omitempty"`
+	Git  *GitSourceSpec `json:"git,omitempty"`
+}
+
+// GitSourceSpec is the per-function Git deployment config. AuthSecret
+// references a project-scoped Secret containing a personal access token
+// for cloning private repos. WebhookSecret is the HMAC secret the user
+// configures in their Git host's webhook UI.
+type GitSourceSpec struct {
+	URL           string    `json:"url"`
+	Ref           string    `json:"ref,omitempty"`
+	SubPath       string    `json:"subPath,omitempty"`
+	AuthSecret    string    `json:"authSecret,omitempty"`
+	WebhookToken  string    `json:"webhookToken,omitempty"` // url-path-segment, unique per fn
+	WebhookSecret string    `json:"webhookSecret,omitempty"`
+	Build         BuildSpec `json:"build"`
+}
+
+// BuildSpec lets the user override the autodetected build pipeline. With
+// Language="auto" and no Commands set we infer everything from files in
+// the repo (package.json -> node, Cargo.toml -> rust, ...).
+type BuildSpec struct {
+	Language   string   `json:"language,omitempty"`
+	BuildImage string   `json:"buildImage,omitempty"`
+	Commands   []string `json:"commands,omitempty"`
+	Output     string   `json:"output,omitempty"`
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	Template   string   `json:"template,omitempty"`
+}
+
+// Build is one execution of the builder. Logs are streamed live to a
+// channel and persisted to disk at <dataDir>/functions/build-logs/<uid>.log.
+type Build struct {
+	Meta        Meta      `json:"meta"`
+	FunctionRef string    `json:"functionRef"`
+	CommitSHA   string    `json:"commitSha,omitempty"`
+	Trigger     string    `json:"trigger,omitempty"` // "manual" | "webhook" | "create"
+	Status      Phase     `json:"status"`
+	Message     string    `json:"message,omitempty"`
+	StartedAt   time.Time `json:"startedAt,omitempty"`
+	FinishedAt  time.Time `json:"finishedAt,omitempty"`
+	LogsRef     string    `json:"logsRef,omitempty"`    // sha256 of build logs blob
+	ArtifactRef string    `json:"artifactRef,omitempty"` // sha256 of produced artifact (= Function.SourceRef)
+}
+
+// Secret is a project-scoped, encrypted-at-rest credential. The plaintext
+// is never returned by ListSecrets; callers explicitly hit the reveal
+// endpoint (admin only) when they need it.
+type Secret struct {
+	Meta        Meta   `json:"meta"`
+	Description string `json:"description,omitempty"`
+	KeyID       string `json:"keyId"`
+	Nonce       []byte `json:"nonce,omitempty"`
+	Ciphertext  []byte `json:"ciphertext,omitempty"`
+	Version     int    `json:"version"`
+}
+
+// EventRule binds a match pattern to one or more actions. A single rule
+// can carry multiple actions; all configured actions fire when the rule
+// matches an event.
+type EventRule struct {
+	Meta        Meta        `json:"meta"`
+	Description string      `json:"description,omitempty"`
+	Match       EventMatch  `json:"match"`
+	Action      EventAction `json:"action"`
+	Enabled     bool        `json:"enabled"`
+	LastFiredAt time.Time   `json:"lastFiredAt,omitempty"`
+	FireCount   int64       `json:"fireCount,omitempty"`
+}
+
+// EventMatch describes which events fire this rule. An empty Types list
+// matches everything (useful for catch-all log rules). Subject is matched
+// as a glob; for log-pattern events it is the regex to match against the
+// log line.
+type EventMatch struct {
+	Types   []string          `json:"types,omitempty"`
+	Subject string            `json:"subject,omitempty"`
+	Filter  map[string]string `json:"filter,omitempty"`
+}
+
+// EventAction carries one or more sinks. The Log sink is implicit: every
+// emitted event is appended to the cluster event log regardless of any
+// rule.
+type EventAction struct {
+	Webhook   *WebhookAction   `json:"webhook,omitempty"`
+	Invoke    *InvokeAction    `json:"invoke,omitempty"`
+	Container *ContainerAction `json:"container,omitempty"`
+}
+
+type WebhookAction struct {
+	URL     string            `json:"url"`
+	Method  string            `json:"method,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Secret  string            `json:"secret,omitempty"` // HMAC secret; never returned over the wire on list
+}
+
+type InvokeAction struct {
+	Project  string `json:"project,omitempty"`
+	Function string `json:"function"`
+	Path     string `json:"path,omitempty"`
+}
+
+type ContainerAction struct {
+	Project   string `json:"project,omitempty"`
+	Container string `json:"container"`
+	Action    string `json:"action"` // "start" | "stop" | "restart"
+}
+
+// EventRecord is a single observation pushed onto the events bus. It is
+// also persisted to a bounded log per project so the dashboard can show a
+// timeline. This is distinct from the in-process Event type used by the
+// store's pubsub for resource mutations.
+type EventRecord struct {
+	UID     string            `json:"uid"`
+	Type    string            `json:"type"`
+	Project string            `json:"project,omitempty"`
+	Subject string            `json:"subject,omitempty"`
+	At      time.Time         `json:"at"`
+	Data    map[string]string `json:"data,omitempty"`
+	Body    []byte            `json:"body,omitempty"`
+}
+
+// WebhookDelivery records one outbound webhook attempt. Persisted so the
+// UI can show "deliveries" per rule, including retries and errors.
+type WebhookDelivery struct {
+	Meta       Meta      `json:"meta"`
+	Rule       string    `json:"rule"`
+	URL        string    `json:"url"`
+	Status     int       `json:"status,omitempty"`
+	Error      string    `json:"error,omitempty"`
+	Attempt    int       `json:"attempt"`
+	NextAttempt time.Time `json:"nextAttempt,omitempty"`
+	Done       bool      `json:"done"`
+	StartedAt  time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt,omitempty"`
+	EventUID   string    `json:"eventUid,omitempty"`
+	EventType  string    `json:"eventType,omitempty"`
 }
 
 type Bucket struct {
@@ -218,8 +379,15 @@ type ClusterConfig struct {
 	JoinTokens        []JoinToken `json:"joinTokens,omitempty"`
 	GarageRPCSecret   string      `json:"garageRpcSecret,omitempty"`
 	GarageAdminToken  string      `json:"garageAdminToken,omitempty"`
-	CreatedAt         time.Time   `json:"createdAt"`
-	UpdatedAt         time.Time   `json:"updatedAt"`
+	// Internal S3 admin credentials used by the dashboard's bucket
+	// browser. Created at first boot. Never returned over the API.
+	S3InternalKeyID     string `json:"s3InternalKeyId,omitempty"`
+	S3InternalKeySecret string `json:"s3InternalKeySecret,omitempty"`
+	// SecretFingerprint is sha256(masterKey)[:8]. Used to detect a
+	// swapped or corrupted master.key file on subsequent boots.
+	SecretFingerprint string    `json:"secretFingerprint,omitempty"`
+	CreatedAt         time.Time `json:"createdAt"`
+	UpdatedAt         time.Time `json:"updatedAt"`
 }
 
 // JoinToken is the cluster-wide artefact a node consumes when running

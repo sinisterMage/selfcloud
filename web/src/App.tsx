@@ -7,9 +7,14 @@ import LoginPage from "./pages/Login";
 import SetupWizard from "./pages/Setup";
 import OverviewPage from "./pages/Overview";
 import ContainersPage from "./pages/Containers";
+import ContainerDetail from "./pages/ContainerDetail";
 import BucketsPage from "./pages/Buckets";
+import BucketBrowser from "./pages/BucketBrowser";
 import FunctionsPage from "./pages/Functions";
+import FunctionDetail from "./pages/FunctionDetail";
 import NodesPage from "./pages/Nodes";
+import SecretsPage from "./pages/Secrets";
+import EventsPage from "./pages/Events";
 import SettingsPage from "./pages/Settings";
 
 export default function App() {
@@ -53,9 +58,17 @@ export default function App() {
 function AuthenticatedApp() {
   const navigate = useNavigate();
   const [authed, setAuthed] = useState(!!getToken());
+  const [userEmail, setUserEmail] = useState<string | undefined>(undefined);
 
   useEffect(() => {
-    if (!authed) navigate("/login");
+    if (!authed) {
+      navigate("/login");
+      return;
+    }
+    api
+      .get<{ identity?: { email?: string }; user?: { email?: string } }>("/api/v1/auth/me")
+      .then((m) => setUserEmail(m.user?.email ?? m.identity?.email))
+      .catch(() => undefined);
   }, [authed, navigate]);
 
   return (
@@ -72,11 +85,26 @@ function AuthenticatedApp() {
           />
         }
       />
-      <Route element={<Layout onLogout={() => { setToken(null); setAuthed(false); }} />}>
+      <Route
+        element={
+          <Layout
+            userEmail={userEmail}
+            onLogout={() => {
+              setToken(null);
+              setAuthed(false);
+            }}
+          />
+        }
+      >
         <Route index element={<OverviewPage />} />
         <Route path="/containers" element={<ContainersPage />} />
+        <Route path="/containers/:name" element={<ContainerDetail />} />
         <Route path="/buckets" element={<BucketsPage />} />
+        <Route path="/buckets/:name" element={<BucketBrowser />} />
         <Route path="/functions" element={<FunctionsPage />} />
+        <Route path="/functions/:name" element={<FunctionDetail />} />
+        <Route path="/secrets" element={<SecretsPage />} />
+        <Route path="/events" element={<EventsPage />} />
         <Route path="/nodes" element={<NodesPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" />} />

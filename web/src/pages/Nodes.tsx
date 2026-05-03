@@ -1,8 +1,11 @@
 import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Copy, Plus } from "lucide-react";
+import { Copy, Network, Plus } from "lucide-react";
+import { toast } from "sonner";
 import { api } from "../lib/api";
 import type { ClusterConfig, Node } from "../lib/types";
+import { SkeletonRows } from "../components/Skeleton";
+import EmptyState from "../components/EmptyState";
 
 export default function NodesPage() {
   const cluster = useQuery<ClusterConfig>({
@@ -18,7 +21,11 @@ export default function NodesPage() {
   const issue = useMutation({
     mutationFn: () =>
       api.post<{ command: string; expiresAt: string }>("/api/v1/cluster/join-tokens", { ttl: "24h" }),
-    onSuccess: setIssued,
+    onSuccess: (d) => {
+      setIssued(d);
+      toast.success("Join token issued (valid 24h)");
+    },
+    onError: (e) => toast.error(e instanceof Error ? e.message : "issue failed"),
   });
 
   return (
@@ -52,7 +59,13 @@ export default function NodesPage() {
           <div className="text-muted text-sm">Run this on the new machine (token expires {new Date(issued.expiresAt).toLocaleString()}):</div>
           <div className="flex items-center gap-2">
             <pre className="bg-elevated rounded-md px-3 py-2 text-xs font-mono break-all flex-1">{issued.command}</pre>
-            <button className="btn" onClick={() => navigator.clipboard.writeText(issued.command)}>
+            <button
+              className="btn"
+              onClick={() => {
+                navigator.clipboard.writeText(issued.command);
+                toast.success("Copied to clipboard");
+              }}
+            >
               <Copy size={14} />
             </button>
           </div>
@@ -71,23 +84,33 @@ export default function NodesPage() {
             </tr>
           </thead>
           <tbody>
-            {(nodes.data ?? []).map((n) => (
-              <tr key={n.meta.uid} className="border-t border-border">
-                <td className="px-4 py-2 font-mono">{n.meta.name}</td>
-                <td className="px-4 py-2 font-mono text-muted">{n.address}</td>
-                <td className="px-4 py-2">
-                  {n.roles?.map((r) => <span key={r} className="badge mr-1">{r}</span>)}
+            {nodes.isLoading && <SkeletonRows rows={2} cols={5} />}
+            {!nodes.isLoading &&
+              (nodes.data ?? []).map((n) => (
+                <tr key={n.meta.uid} className="border-t border-border">
+                  <td className="px-4 py-2 font-mono">{n.meta.name}</td>
+                  <td className="px-4 py-2 font-mono text-muted">{n.address}</td>
+                  <td className="px-4 py-2">
+                    {n.roles?.map((r) => <span key={r} className="badge mr-1">{r}</span>)}
+                  </td>
+                  <td className="px-4 py-2">
+                    <span className={n.status?.phase === "Running" ? "badge-success" : "badge"}>
+                      {n.status?.phase || "—"}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2 font-mono text-muted">{n.version}</td>
+                </tr>
+              ))}
+            {!nodes.isLoading && !nodes.data?.length && (
+              <tr>
+                <td colSpan={5}>
+                  <EmptyState
+                    icon={Network}
+                    title="Solo node"
+                    description="This machine is the only node so far. Switch to multi-node mode in Settings, then add another machine here."
+                  />
                 </td>
-                <td className="px-4 py-2">
-                  <span className={n.status?.phase === "Running" ? "badge-success" : "badge"}>
-                    {n.status?.phase || "—"}
-                  </span>
-                </td>
-                <td className="px-4 py-2 font-mono text-muted">{n.version}</td>
               </tr>
-            ))}
-            {!nodes.data?.length && (
-              <tr><td colSpan={5} className="px-4 py-12 text-center text-muted">This machine is the only node so far.</td></tr>
             )}
           </tbody>
         </table>

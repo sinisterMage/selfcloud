@@ -1,11 +1,16 @@
-// Package wasm hosts selfcloud's Wasmtime-based functions runtime. Functions
-// are uploaded as `.wasm` bytes (WASI Preview 2), assigned to triggers, and
-// invoked from the ingress proxy or the cron scheduler.
+// Package wasm hosts selfcloud's WebAssembly functions runtime. Functions
+// are uploaded as `.wasm` bytes targeting `wasm32-wasi` (WASI Preview 1),
+// assigned to triggers, and invoked from the ingress proxy or the cron
+// scheduler.
 //
-// To keep selfcloud's dep tree light we don't require Wasmtime by default -
-// we ship a "stub" runtime that returns canned responses, plus a real
-// Wasmtime-backed runtime wired in when the `wasmtime` build tag is set.
-// Both implementations conform to the same Runtime interface.
+// The default runtime is wazero (pure Go, no CGO), which keeps selfcloud a
+// single static binary. The ABI is intentionally trivial so any toolchain
+// that targets `wasm32-wasi` works out of the box (TinyGo, Rust, Zig,
+// AssemblyScript, the experimental Go target, ...): the guest reads a JSON
+// request envelope from stdin and writes a JSON response envelope to stdout;
+// stderr is captured into the response Logs field.
+//
+// A no-op `Stub` is also provided for tests and bootstrap.
 package wasm
 
 import (
